@@ -1,0 +1,15 @@
+name: ci-cd-min
+on:
+  workflow_call:
+    inputs:
+      app_type:
+        type: string
+        required: true
+      deploy_in_workflow:
+        type: boolean
+        default: true
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "minimal reusable workflow ran, app_type=${{ inputs.app_type }}"
