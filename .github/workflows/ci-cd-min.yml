@@ -9,7 +9,23 @@ on:
         type: boolean
         default: true
 jobs:
-  hello:
+  pr-source:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
     runs-on: ubuntu-latest
     steps:
-      - run: echo "minimal reusable workflow ran, app_type=${{ inputs.app_type }}"
+      - name: Enforce PR source for main
+        env:
+          HEAD: ${{ github.head_ref }}
+        run: |
+          if [[ "$HEAD" == "dev" || "$HEAD" == release/* || "$HEAD" == hotfix/* ]]; then
+            echo "allowed"
+          else
+            echo "::error::bad source"; exit 1
+          fi
+  quality-gate:
+    uses: triarchsecurity/shared-workflows/.github/workflows/quality-gate.yml@release/v9
+    with:
+      run_qa_tests: false
+      run_pentest: false
+      needs_server: false
+    secrets: inherit
