@@ -94,6 +94,10 @@ on:
         description: 'POST the deploy to admin release-logs (CL-4 source data).'
         type: boolean
         default: true
+      db_check_command:
+        description: 'Optional READ-ONLY DB drift check (e.g. "npm run db:check"). Empty => skipped. When set, it gates deploy. Must be read-only — never a migration (prod DATABASE_URL hazard).'
+        type: string
+        default: ''
 
 concurrency:
   group: ci-cd-${{ github.event_name }}-${{ github.ref }}
@@ -180,6 +184,28 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "Extracted version: $VER"
 
+  # --- GATE: optional read-only DB drift check (db_check_command set). Runs on
+  #     PR + push so it gates both; deploy jobs require it (success-or-skipped). --
+  db-check:
+    needs: quality-gate
+    if: inputs.db_check_command != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node_version }}
+          registry-url: 'https://npm.pkg.github.com'
+      - name: Install dependencies
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm ci
+      - name: Run DB drift check (read-only)
+        env:
+          DB_CHECK_CMD: ${{ inputs.db_check_command }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: bash -c "$DB_CHECK_CMD"
+
   # --- GATE: dev-must-deploy-first ancestry check (prod only) -------------------
   verify-dev-deployed:
     needs: env-select
@@ -210,11 +236,12 @@ jobs:
 
   # --- deploy: dev ---------------------------------------------------------------
   deploy-dev:
-    needs: [quality-gate, env-select, version]
+    needs: [quality-gate, env-select, version, db-check]
     if: |
       always() && inputs.deploy_in_workflow &&
       github.event_name == 'push' && github.ref == 'refs/heads/dev' &&
-      needs.quality-gate.result == 'success' && needs.env-select.result == 'success'
+      needs.quality-gate.result == 'success' && needs.env-select.result == 'success' &&
+      (needs.db-check.result == 'success' || needs.db-check.result == 'skipped')
     uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
     with:
       firebase_project_id: ${{ inputs.firebase_project_id }}
@@ -227,7 +254,7 @@ jobs:
 
   # --- deploy: prod --------------------------------------------------------------
   deploy-prod:
-    needs: [quality-gate, version, env-select, verify-dev-deployed, gate-prod, cl4-gate]
+    needs: [quality-gate, version, env-select, verify-dev-deployed, gate-prod, cl4-gate, db-check]
     if: |
       always() && inputs.deploy_in_workflow &&
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
@@ -235,7 +262,8 @@ jobs:
       needs.env-select.result == 'success' &&
       (needs.verify-dev-deployed.result == 'success' || needs.verify-dev-deployed.result == 'skipped') &&
       (needs.gate-prod.result == 'success' || needs.gate-prod.result == 'skipped') &&
-      (needs.cl4-gate.result == 'success' || needs.cl4-gate.result == 'skipped')
+      (needs.cl4-gate.result == 'success' || needs.cl4-gate.result == 'skipped') &&
+      (needs.db-check.result == 'success' || needs.db-check.result == 'skipped')
     uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
     with:
       firebase_project_id: ${{ inputs.firebase_project_id }}
