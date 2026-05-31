@@ -32,13 +32,18 @@ jobs:
         id: audit
         run: |
           set -uo pipefail
-          drift=""
+          drift=""; unreadable=0; total=0
           for repo in $DEPLOYABLE_REPOS; do
-            # Fetch the repo's ci-cd.yml (base64), decode, check for the expected canonical ref.
-            content=$(gh api "repos/$ORG/$repo/contents/.github/workflows/ci-cd.yml" \
-              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+            total=$((total+1))
+            # Fetch the repo's ci-cd.yml (base64). A non-zero exit = the API couldn't read
+            # it (auth/404) — track separately so a token problem isn't reported as drift.
+            if b64=$(gh api "repos/$ORG/$repo/contents/.github/workflows/ci-cd.yml" --jq '.content' 2>/dev/null); then
+              content=$(echo "$b64" | base64 -d 2>/dev/null || echo "")
+            else
+              content=""; unreadable=$((unreadable+1))
+            fi
             if [ -z "$content" ]; then
-              drift="${drift}\n- :x: *${repo}*: no .github/workflows/ci-cd.yml found"
+              drift="${drift}\n- :x: *${repo}*: ci-cd.yml unreadable or absent"
             elif ! echo "$content" | grep -q "$EXPECTED_REF"; then
               # Has a ci-cd.yml but does not reference the canonical @release/v9.
               ref=$(echo "$content" | grep -oE 'shared-workflows/\.github/workflows/[a-z-]+\.yml@[^ ]+' | head -1 || echo 'unknown')
@@ -47,6 +52,11 @@ jobs:
               echo "✓ $repo — on canonical"
             fi
           done
+          # If EVERY repo was unreadable it is almost certainly the token, not real drift —
+          # all deployable repos have some ci-cd.yml. Report that distinctly (no false alarm).
+          if [ "$total" -gt 0 ] && [ "$unreadable" -eq "$total" ]; then
+            drift="\n- :key: AUDIT TOKEN cannot read org repos (all ${total} reads failed). Set the AUDIT_PAT secret (a PAT with repo:read). No adoption check was performed this run."
+          fi
 
           {
             echo "## Canonical CI/CD adoption audit"
