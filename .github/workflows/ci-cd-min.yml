@@ -2,30 +2,31 @@ name: ci-cd-min
 on:
   workflow_call:
     inputs:
-      app_type:
-        type: string
-        required: true
-      deploy_in_workflow:
-        type: boolean
-        default: true
+      app_type: { type: string, required: true }
+      deploy_in_workflow: { type: boolean, default: true }
 jobs:
-  pr-source:
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Enforce PR source for main
-        env:
-          HEAD: ${{ github.head_ref }}
-        run: |
-          if [[ "$HEAD" == "dev" || "$HEAD" == release/* || "$HEAD" == hotfix/* ]]; then
-            echo "allowed"
-          else
-            echo "::error::bad source"; exit 1
-          fi
-  quality-gate:
-    uses: triarchsecurity/shared-workflows/.github/workflows/quality-gate.yml@release/v9
+  t-verify:
+    if: false
+    uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9
+  t-gate:
+    if: false
+    uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@release/v9
     with:
-      run_qa_tests: false
-      run_pentest: false
-      needs_server: false
+      project_key: x
+      target_version: 0.0.0
+    secrets:
+      ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+  t-deploy:
+    if: false
+    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
+    with:
+      firebase_project_id: x
+      environment: dev
+    secrets: inherit
+  t-notify:
+    if: false
+    uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@release/v9
+    with:
+      status: success
+      project_name: x
     secrets: inherit
