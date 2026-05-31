@@ -8,10 +8,12 @@ name: ci-cd
 # Everything that is a GATE is centralized here and is NOT optional, so a new
 # repo cannot skip gating. Repo-specific values are inputs only.
 #
-# Internal composition uses LOCAL refs (`./.github/workflows/x.yml`) so every
-# sub-workflow runs at THIS workflow's commit — no internal version drift (the
-# F1 problem). Consumers track the moving `release/v9` branch, so a change here
-# propagates to all repos on their next run.
+# Internal composition pins sub-workflows at @release/v9 — the SAME moving ref
+# consumers track — so the whole pipeline (this workflow + its sub-workflows)
+# moves together, with no internal version drift (the F1 problem). A local `./`
+# ref cannot be used here: GitHub rejects local reusable-workflow paths when the
+# workflow is itself called cross-repo. Consumers track `release/v9`, so a change
+# here propagates to all repos on their next run.
 #
 # Owner decisions baked in (2026-05-31):
 #   - Security scans (semgrep/osv/gitleaks) run ONCE on the dev path, never on
@@ -123,7 +125,7 @@ jobs:
   # --- GATE: build + scans + (push-only) QA/pentest -----------------------------
   # Security scans run on the dev path only (skip main push + PR->main).
   quality-gate:
-    uses: ./.github/workflows/quality-gate.yml
+    uses: triarchsecurity/shared-workflows/.github/workflows/quality-gate.yml@release/v9
     with:
       node_version: ${{ inputs.node_version }}
       needs_build: true
@@ -182,14 +184,14 @@ jobs:
   verify-dev-deployed:
     needs: env-select
     if: needs.env-select.outputs.environment == 'prod'
-    uses: ./.github/workflows/verify-dev-deployed.yml
+    uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9
 
   # --- GATE: CL-4 prod-version invariants (prod only). Centralized for ALL prod
   #     entrypoints so it cannot be bypassed (fixes truthtreason F3). ------------
   cl4-gate:
     needs: [env-select, version]
     if: needs.env-select.outputs.environment == 'prod'
-    uses: ./.github/workflows/gate-prod-version.yml
+    uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@release/v9
     with:
       project_key: ${{ inputs.project_key }}
       target_version: ${{ needs.version.outputs.version }}
@@ -213,7 +215,7 @@ jobs:
       always() && inputs.deploy_in_workflow &&
       github.event_name == 'push' && github.ref == 'refs/heads/dev' &&
       needs.quality-gate.result == 'success' && needs.env-select.result == 'success'
-    uses: ./.github/workflows/deploy-firebase.yml
+    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
     with:
       firebase_project_id: ${{ inputs.firebase_project_id }}
       deploy_command: ${{ inputs.deploy_command }}
@@ -234,7 +236,7 @@ jobs:
       (needs.verify-dev-deployed.result == 'success' || needs.verify-dev-deployed.result == 'skipped') &&
       (needs.gate-prod.result == 'success' || needs.gate-prod.result == 'skipped') &&
       (needs.cl4-gate.result == 'success' || needs.cl4-gate.result == 'skipped')
-    uses: ./.github/workflows/deploy-firebase.yml
+    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
     with:
       firebase_project_id: ${{ inputs.firebase_project_id }}
       deploy_command: ${{ inputs.deploy_command }}
@@ -286,7 +288,7 @@ jobs:
   notify:
     needs: [quality-gate, env-select, version, deploy-dev, deploy-prod]
     if: always() && inputs.deploy_in_workflow && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    uses: ./.github/workflows/notify.yml
+    uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@release/v9
     with:
       status: ${{ needs.deploy-prod.result != 'skipped' && needs.deploy-prod.result || needs.deploy-dev.result }}
       version: ${{ needs.version.outputs.version }}
