@@ -5,17 +5,6 @@ on:
       app_type: { type: string, required: true }
       deploy_in_workflow: { type: boolean, default: true }
 jobs:
-  t-verify:
-    if: false
-    uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9
-  t-gate:
-    if: false
-    uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@release/v9
-    with:
-      project_key: x
-      target_version: 0.0.0
-    secrets:
-      ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
   t-deploy:
     if: false
     uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
