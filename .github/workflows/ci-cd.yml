@@ -1,0 +1,300 @@
+name: ci-cd
+
+# ============================================================================
+# CANONICAL Triarch CI/CD pipeline. ONE workflow every repo calls.
+#
+# Design: docs/ci-cd-canonical.md (and the 2026-05-31 consolidation design).
+# Consumers reduce to a thin caller (triggers + this `uses:` + inputs + secrets).
+# Everything that is a GATE is centralized here and is NOT optional, so a new
+# repo cannot skip gating. Repo-specific values are inputs only.
+#
+# Internal composition pins sub-workflows at @release/v9 — the SAME moving ref
+# consumers track — so the whole pipeline (this workflow + its sub-workflows)
+# moves together, with no internal version drift (the F1 problem). A local `./`
+# ref cannot be used here: GitHub rejects local reusable-workflow paths when the
+# workflow is itself called cross-repo. Consumers track `release/v9`, so a change
+# here propagates to all repos on their next run.
+#
+# Owner decisions baked in (2026-05-31):
+#   - Security scans (semgrep/osv/gitleaks) run ONCE on the dev path, never on
+#     the dev->main promotion (no duplication).
+#   - QA + pentest run on PUSH events only (pre-deploy), never on every PR commit.
+#
+# app_type:
+#   next-app  -> full quality-gate + build + dev/prod gating + FAH deploy + notify
+#   static    -> quality-gate + build; deploy owned by FAH native integration
+#                (set deploy_in_workflow:false)
+#   mcp/lib/python -> ITERATION 2 (build/publish paths not yet centralized here;
+#                     these repos stay on their current workflows until added).
+# ============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      app_type:
+        description: 'next-app | static | mcp | lib | python'
+        type: string
+        required: true
+      # --- identity ---
+      project_key:
+        description: 'CL-4 registry key in admin (projects.key). Required for next-app/static.'
+        type: string
+        required: false
+        default: ''
+      firebase_project_id:
+        type: string
+        required: false
+        default: ''
+      app_hosting_backend:
+        description: 'PROD FAH backend id.'
+        type: string
+        required: false
+        default: ''
+      dev_backend:
+        description: 'Explicit dev backend. Empty => auto-suffix <app_hosting_backend>-dev. Set for legacy repos (admin, darksouls).'
+        type: string
+        required: false
+        default: ''
+      # --- hostnames ---
+      prod_url:
+        type: string
+        required: false
+        default: ''
+      dev_url:
+        type: string
+        required: false
+        default: ''
+      project_name:
+        description: 'Human label for notifications.'
+        type: string
+        required: false
+        default: ''
+      # --- build / capability toggles ---
+      node_version:
+        type: string
+        default: '22'
+      deploy_command:
+        type: string
+        default: 'apphosting'
+      run_qa_tests:
+        description: 'Run QA suite (push events only; ignored on PRs regardless).'
+        type: boolean
+        default: false
+      run_pentest:
+        type: boolean
+        default: false
+      needs_server:
+        type: boolean
+        default: false
+      deploy_in_workflow:
+        description: 'false => FAH native GitHub integration owns deploy (www). Skips in-workflow deploy jobs.'
+        type: boolean
+        default: true
+      record_release:
+        description: 'POST the deploy to admin release-logs (CL-4 source data).'
+        type: boolean
+        default: true
+
+concurrency:
+  group: ci-cd-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  # --- GATE: PR-source enforcement (centralized; was per-repo enforce-pr-source) -
+  # Main may only receive PRs from dev / release/* / hotfix/*. Triggers on edited
+  # so a base-branch retarget is re-checked (review gap C6).
+  pr-source:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce PR source for main
+        env:
+          HEAD: ${{ github.head_ref }}
+        run: |
+          if [[ "$HEAD" == "dev" || "$HEAD" == release/* || "$HEAD" == hotfix/* ]]; then
+            echo "PR into main from '$HEAD' — allowed."
+          else
+            echo "::error::PRs into main must come from dev, release/*, or hotfix/* (got '$HEAD')."
+            exit 1
+          fi
+
+  # --- GATE: build + scans + (push-only) QA/pentest -----------------------------
+  # Security scans run on the dev path only (skip main push + PR->main).
+  quality-gate:
+    uses: triarchsecurity/shared-workflows/.github/workflows/quality-gate.yml@release/v9
+    with:
+      node_version: ${{ inputs.node_version }}
+      needs_build: true
+      needs_server: ${{ inputs.needs_server && github.event_name == 'push' }}
+      run_qa_tests: ${{ inputs.run_qa_tests && github.event_name == 'push' }}
+      run_pentest: ${{ inputs.run_pentest && github.event_name == 'push' }}
+      run_security_scans: ${{ !(github.ref == 'refs/heads/main' || github.base_ref == 'main') }}
+    secrets: inherit
+
+  # --- env-select: branch -> environment + backend (internalized) ---------------
+  env-select:
+    needs: quality-gate
+    if: inputs.deploy_in_workflow && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.pick.outputs.env }}
+      backend: ${{ steps.pick.outputs.backend }}
+    steps:
+      - id: pick
+        env:
+          REF: ${{ github.ref }}
+          PROD_BACKEND: ${{ inputs.app_hosting_backend }}
+          DEV_BACKEND: ${{ inputs.dev_backend }}
+        run: |
+          if [ "$REF" = "refs/heads/dev" ]; then
+            echo "env=dev" >> "$GITHUB_OUTPUT"
+            if [ -n "$DEV_BACKEND" ]; then
+              echo "backend=$DEV_BACKEND" >> "$GITHUB_OUTPUT"
+            else
+              echo "backend=${PROD_BACKEND}-dev" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "env=prod" >> "$GITHUB_OUTPUT"
+            echo "backend=$PROD_BACKEND" >> "$GITHUB_OUTPUT"
+          fi
+
+  # --- version: extract package.json version ONCE (internalized) ----------------
+  version:
+    needs: quality-gate
+    if: inputs.deploy_in_workflow && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: extract
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          if [ -z "$VER" ]; then
+            echo "::error::package.json version is empty"; exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Extracted version: $VER"
+
+  # --- GATE: dev-must-deploy-first ancestry check (prod only) -------------------
+  verify-dev-deployed:
+    needs: env-select
+    if: needs.env-select.outputs.environment == 'prod'
+    uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9
+
+  # --- GATE: CL-4 prod-version invariants (prod only). Centralized for ALL prod
+  #     entrypoints so it cannot be bypassed (fixes truthtreason F3). ------------
+  cl4-gate:
+    needs: [env-select, version]
+    if: needs.env-select.outputs.environment == 'prod'
+    uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@release/v9
+    with:
+      project_key: ${{ inputs.project_key }}
+      target_version: ${{ needs.version.outputs.version }}
+    secrets:
+      ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+
+  # --- GATE: GitHub Environment binding (prod only). No reviewer by default
+  #     (preserves current behavior; opt-in approval via repo env settings). ----
+  gate-prod:
+    needs: [env-select, verify-dev-deployed]
+    if: needs.env-select.outputs.environment == 'prod'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - run: echo "Production deploy approved for ${{ inputs.project_name }}."
+
+  # --- deploy: dev ---------------------------------------------------------------
+  deploy-dev:
+    needs: [quality-gate, env-select, version]
+    if: |
+      always() && inputs.deploy_in_workflow &&
+      github.event_name == 'push' && github.ref == 'refs/heads/dev' &&
+      needs.quality-gate.result == 'success' && needs.env-select.result == 'success'
+    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
+    with:
+      firebase_project_id: ${{ inputs.firebase_project_id }}
+      deploy_command: ${{ inputs.deploy_command }}
+      app_hosting_backend: ${{ inputs.app_hosting_backend }}
+      dev_backend: ${{ inputs.dev_backend }}
+      app_url: ${{ inputs.dev_url }}
+      environment: dev
+    secrets: inherit
+
+  # --- deploy: prod --------------------------------------------------------------
+  deploy-prod:
+    needs: [quality-gate, version, env-select, verify-dev-deployed, gate-prod, cl4-gate]
+    if: |
+      always() && inputs.deploy_in_workflow &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.quality-gate.result == 'success' &&
+      needs.env-select.result == 'success' &&
+      (needs.verify-dev-deployed.result == 'success' || needs.verify-dev-deployed.result == 'skipped') &&
+      (needs.gate-prod.result == 'success' || needs.gate-prod.result == 'skipped') &&
+      (needs.cl4-gate.result == 'success' || needs.cl4-gate.result == 'skipped')
+    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
+    with:
+      firebase_project_id: ${{ inputs.firebase_project_id }}
+      deploy_command: ${{ inputs.deploy_command }}
+      app_hosting_backend: ${{ inputs.app_hosting_backend }}
+      app_url: ${{ inputs.prod_url }}
+      environment: prod
+    secrets: inherit
+
+  # --- record-release: POST deploy to admin (CL-4 source data; internalized) ----
+  record-release:
+    needs: [env-select, version, deploy-dev, deploy-prod]
+    if: |
+      always() && inputs.record_release &&
+      github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') &&
+      (needs.deploy-dev.result == 'success' || needs.deploy-prod.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: POST release to admin
+        env:
+          ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
+          ENV_NAME: ${{ needs.env-select.outputs.environment }}
+          VERSION: ${{ needs.version.outputs.version }}
+          GH_SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ -z "$ADMIN_API_TOKEN" ]; then
+            echo "::warning::ADMIN_API_TOKEN not set — skipping release log POST"; exit 0
+          fi
+          BRANCH="${REF#refs/heads/}"
+          DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          if echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.0$'; then RTYPE="minor"; else RTYPE="patch"; fi
+          PAYLOAD=$(jq -n \
+            --arg version "v$VERSION" --arg releaseType "$RTYPE" --arg env "$ENV_NAME" \
+            --arg commitSha "$GH_SHA" --arg deployedAt "$DEPLOYED_AT" --arg branch "$BRANCH" \
+            --arg releasedBy "github-actions/${GITHUB_ACTOR}" \
+            '{version:$version,releaseType:$releaseType,env:$env,commitSha:$commitSha,deployedAt:$deployedAt,branch:$branch,releasedBy:$releasedBy}')
+          HTTP_CODE=$(curl -s --max-time 10 -o /tmp/resp.txt -w "%{http_code}" \
+            -X POST "https://admin.triarch.dev/api/platform/ingest/release-logs" \
+            -H "Authorization: Bearer $ADMIN_API_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
+          BODY=$(head -c 400 /tmp/resp.txt 2>/dev/null || echo "")
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+            echo "✓ Release recorded (HTTP $HTTP_CODE): $BODY"
+          else
+            echo "::warning::Release log POST failed (HTTP $HTTP_CODE): $BODY — next prod cl4-gate will reflect drift."
+          fi
+
+  # --- notify: FAH rollout poll + Slack -----------------------------------------
+  notify:
+    needs: [quality-gate, env-select, version, deploy-dev, deploy-prod]
+    if: always() && inputs.deploy_in_workflow && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@release/v9
+    with:
+      status: ${{ needs.deploy-prod.result != 'skipped' && needs.deploy-prod.result || needs.deploy-dev.result }}
+      version: ${{ needs.version.outputs.version }}
+      project_name: ${{ inputs.project_name }} (${{ needs.env-select.outputs.environment }})
+      app_url: ${{ needs.env-select.outputs.environment == 'prod' && inputs.prod_url || inputs.dev_url }}
+      app_hosting_backend: ${{ needs.env-select.outputs.backend }}
+      firebase_project_id: ${{ inputs.firebase_project_id }}
+      wait_for_fah: true
+    secrets: inherit

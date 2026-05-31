@@ -37,13 +37,19 @@ on:
         type: string
         default: 'prod'
     secrets:
+      # required:false so the canonical ci-cd.yml can be referenced by repos that
+      # never deploy through it (static/FAH-native, e.g. www). GitHub validates
+      # required secrets at STARTUP for every referenced reusable workflow even when
+      # the job is if-skipped, so a hard requirement here would block those repos.
+      # Real deployers still pass the secret via inherit; the deploy step fails
+      # clearly at runtime if it is genuinely absent.
       FIREBASE_SA_KEY:
-        required: true
+        required: false
       GH_PAT:
         required: false
       ADMIN_API_TOKEN:
         description: 'Per-project Bearer token for admin callback (valued with projects.apiKey from CRDB).'
-        required: true
+        required: false
     outputs:
       version:
         description: "Extracted app version from version.ts or version.js"

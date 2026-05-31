@@ -68,9 +68,12 @@ on:
         type: number
         default: 300
     secrets:
+      # required:false so the canonical ci-cd.yml is referenceable by non-deploying
+      # repos (GitHub validates required secrets at startup for every referenced
+      # reusable workflow, even if-skipped). The cl4-gate job is prod-path only.
       ADMIN_API_TOKEN:
         description: 'Per-project Bearer token for admin callback (projects.apiKey from CRDB).'
-        required: true
+        required: false
     outputs:
       dev_version:
         description: 'Current dev version reported by admin.'

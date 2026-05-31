@@ -1,0 +1,6 @@
+# shared-workflows is the single source of truth for every repo's CI/CD.
+# Consumers track the moving `release/v9` branch, so ANY change here propagates
+# org-wide on the next run. That makes this repo the supply-chain trust boundary —
+# all changes to the pipeline and its actions require explicit owner review.
+* @MyAlterLego
+/.github/workflows/ @MyAlterLego
