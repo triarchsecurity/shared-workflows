@@ -33,6 +33,10 @@ on:
       needs_build:
         type: boolean
         default: true
+      build_command:
+        type: string
+        default: 'npm run build'
+        description: 'Build command (override for monorepos, e.g. "npm run build -w @scope/web").'
       run_security_scans:
         type: boolean
         default: true
@@ -93,7 +97,9 @@ jobs:
 
       - name: Build application
         if: inputs.needs_build
-        run: npm run build
+        env:
+          BUILD_CMD: ${{ inputs.build_command }}
+        run: bash -c "$BUILD_CMD"
 
       - name: Start server
         if: inputs.needs_server
