@@ -93,7 +93,15 @@ jobs:
       - name: Install dependencies
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm ci
+        # --include=optional forces platform-specific optional native deps to install.
+        # npm intermittently omits them (e.g. lightningcss-linux-x64-gnu, the Tailwind v4 /
+        # Turbopack binary), causing flaky "Cannot find module '../lightningcss.linux-x64-gnu.node'"
+        # build failures. Belt-and-suspenders: rebuild the native module if it's still missing.
+        run: |
+          npm ci --include=optional
+          if [ -d node_modules/lightningcss ] && ! node -e "require('lightningcss')" 2>/dev/null; then
+            echo "lightningcss native binary missing — rebuilding"; npm rebuild lightningcss
+          fi
 
       - name: Build application
         if: inputs.needs_build
