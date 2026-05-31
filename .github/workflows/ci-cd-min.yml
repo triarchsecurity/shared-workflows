@@ -8,10 +8,18 @@ jobs:
   t-deploy:
     if: false
     uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
-    with:
-      firebase_project_id: x
-      environment: dev
-    secrets:
-      FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
-      ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
-      GH_PAT: ${{ secrets.GH_PAT }}
+    with: { firebase_project_id: x, environment: dev }
+    secrets: inherit
+  t-gate:
+    if: false
+    uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@release/v9
+    with: { project_key: x, target_version: 0.0.0 }
+    secrets: inherit
+  t-notify:
+    if: false
+    uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@release/v9
+    with: { status: success, project_name: x }
+    secrets: inherit
+  t-verify:
+    if: false
+    uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9
