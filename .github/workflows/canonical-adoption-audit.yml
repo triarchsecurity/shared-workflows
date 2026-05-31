@@ -1,0 +1,84 @@
+name: Canonical CI/CD Adoption Audit
+
+# DETECTIVE enforcement (the org is on GitHub Team — org-level required-workflow
+# rulesets are Enterprise-only, so adoption can't be made un-skippable preventively).
+# This bot enumerates the deployable repos and verifies each calls the canonical
+# workflow (ci-cd.yml@release/v9). Any repo that drifted — or a NEW repo missing the
+# caller — fails the audit and posts to Slack, so a human fixes it. Runs weekly + on demand.
+#
+# Requires an org PAT (secret AUDIT_PAT or GH_PAT) with repo:read on the org's repos.
+# Optional Slack alert via SLACK_BOT_TOKEN + SLACK_CHANNEL_ID (org secrets).
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'   # Mondays 14:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      ORG: triarchsecurity
+      EXPECTED_REF: 'ci-cd.yml@release/v9'
+      # Deployable next-apps that MUST call the canonical workflow.
+      DEPLOYABLE_REPOS: >-
+        security-admin security-portal platform dev-portal tmi truthtreason www darksouls trpg-platform
+      GH_TOKEN: ${{ secrets.AUDIT_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Audit canonical adoption
+        id: audit
+        run: |
+          set -uo pipefail
+          drift=""
+          for repo in $DEPLOYABLE_REPOS; do
+            # Fetch the repo's ci-cd.yml (base64), decode, check for the expected canonical ref.
+            content=$(gh api "repos/$ORG/$repo/contents/.github/workflows/ci-cd.yml" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+            if [ -z "$content" ]; then
+              drift="${drift}\n- :x: *${repo}*: no .github/workflows/ci-cd.yml found"
+            elif ! echo "$content" | grep -q "$EXPECTED_REF"; then
+              # Has a ci-cd.yml but does not reference the canonical @release/v9.
+              ref=$(echo "$content" | grep -oE 'shared-workflows/\.github/workflows/[a-z-]+\.yml@[^ ]+' | head -1 || echo 'unknown')
+              drift="${drift}\n- :warning: *${repo}*: ci-cd.yml does NOT call ${EXPECTED_REF} (found: ${ref:-none})"
+            else
+              echo "✓ $repo — on canonical"
+            fi
+          done
+
+          {
+            echo "## Canonical CI/CD adoption audit"
+            if [ -z "$drift" ]; then
+              echo "✅ All deployable repos call the canonical \`${EXPECTED_REF}\`."
+            else
+              echo "❌ Drift detected:"
+              echo -e "$drift"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Expose for the Slack + gate steps.
+          { echo "drift<<EOF"; echo -e "$drift"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Slack alert on drift
+        if: steps.audit.outputs.drift != ''
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          DRIFT: ${{ steps.audit.outputs.drift }}
+        run: |
+          if [ -z "${SLACK_BOT_TOKEN:-}" ] || [ -z "${SLACK_CHANNEL_ID:-}" ]; then
+            echo "::warning::Slack secrets absent — drift not posted (see step summary)."; exit 0
+          fi
+          text=$(printf ':rotating_light: *Canonical CI/CD adoption drift*%b\n\nFix: migrate the repo to the thin canonical caller.' "$DRIFT")
+          curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d "$(jq -n --arg c "$SLACK_CHANNEL_ID" --arg t "$text" '{channel:$c, text:$t}')" >/dev/null || true
+
+      - name: Fail the audit on drift
+        if: steps.audit.outputs.drift != ''
+        run: |
+          echo "::error::Canonical adoption drift detected — see the job summary."
+          exit 1
