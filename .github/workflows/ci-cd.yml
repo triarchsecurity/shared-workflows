@@ -73,6 +73,10 @@ on:
       node_version:
         type: string
         default: '22'
+      build_command:
+        description: 'Build command override (monorepos), e.g. "npm run build -w @scope/web".'
+        type: string
+        default: 'npm run build'
       deploy_command:
         type: string
         default: 'apphosting'
@@ -133,6 +137,7 @@ jobs:
     with:
       node_version: ${{ inputs.node_version }}
       needs_build: true
+      build_command: ${{ inputs.build_command }}
       needs_server: ${{ inputs.needs_server && github.event_name == 'push' }}
       run_qa_tests: ${{ inputs.run_qa_tests && github.event_name == 'push' }}
       run_pentest: ${{ inputs.run_pentest && github.event_name == 'push' }}
