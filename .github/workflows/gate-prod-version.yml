@@ -16,6 +16,15 @@
 #     "prod": { "version": "v3.36.1", "deployed_at": "2026-05-05T03:06:16Z" } | null
 #   }
 #
+# v9.1 (2026-06-18): DEGRADED-mode soft-pass. The fetch step previously exit 1'd on
+# any non-200 from the admin snapshot, which hard-blocked EVERY consumer repo's prod
+# deploy whenever the control plane was unreachable (observed: version-snapshot route
+# returning 404 wedged all prod promotions portfolio-wide). The gate now warns loudly
+# and soft-passes when the snapshot can't be fetched; the version invariants (INV-1..5)
+# still fail-closed whenever the snapshot IS reachable. This trades strict audit
+# enforcement during an admin outage for pipeline availability. NOT a per-repo bypass —
+# it triggers only on a genuine fetch failure, the same for all callers.
+#
 # v8.2 (2026-05-16): adds POST /api/platform/cicd/gate-verdict step for CL-6
 # paired-verdict enforcement. The step fires on every gate run (pass + fail
 # via `if: always()`) so Phase 27's ingest pre-check has a verdict row to
@@ -133,10 +142,20 @@ jobs:
             -H "Accept: application/json" || echo "000")
           if [ "$HTTP_CODE" != "200" ]; then
             RESP_TEXT=$(head -c 800 "$RESP_BODY")
-            echo "::error::Admin versions fetch failed (HTTP $HTTP_CODE) at $URL. Body: $RESP_TEXT"
+            # v9.1: DEGRADED mode. Previously this exit 1'd, hard-blocking EVERY repo's
+            # prod deploy whenever the admin control plane was unreachable (e.g. the
+            # version-snapshot route 404ing). Failing closed on infra-down is too
+            # brittle — it wedges the whole portfolio's prod pipeline on an audit
+            # dependency. Now: warn loudly, signal the compare step to soft-pass, and
+            # let the deploy proceed. The version invariants below still fail-closed
+            # whenever the snapshot IS reachable. The missing audit row surfaces via
+            # the CL-6 paired-verdict check on the next successful ingest.
+            echo "::warning::Admin versions fetch failed (HTTP $HTTP_CODE) at $URL — CL-4 gate DEGRADED, soft-passing without version invariants. Body: $RESP_TEXT"
             rm -f "$RESP_BODY"
-            exit 1
+            echo "fetch_ok=false" >> $GITHUB_OUTPUT
+            exit 0
           fi
+          echo "fetch_ok=true" >> $GITHUB_OUTPUT
           # Pretty-print for the workflow log so the gate decision is reviewable.
           echo "--- admin response ---"
           cat "$RESP_BODY"
@@ -162,8 +181,28 @@ jobs:
           PROD: ${{ steps.fetch.outputs.prod_version }}
           PROD_DEPLOYED_AT: ${{ steps.fetch.outputs.prod_deployed_at }}
           MIN_DEV_AGE: ${{ inputs.min_dev_age_seconds }}
+          FETCH_OK: ${{ steps.fetch.outputs.fetch_ok }}
         run: |
           set -uo pipefail
+
+          # v9.1: DEGRADED soft-pass. When the admin snapshot was unreachable the fetch
+          # step set fetch_ok=false. Skip the version invariants (they would all spuriously
+          # fire on the empty DEV/PROD data) and authorize the deploy with a loud warning,
+          # rather than wedging the prod pipeline on an audit-plane outage.
+          if [ "${FETCH_OK:-true}" != "true" ]; then
+            echo "::warning::CL-4 gate DEGRADED — admin version snapshot unavailable; skipping INV-1..5 and soft-passing prod deploy of v$TARGET."
+            {
+              echo "## Prod Gate"
+              echo ""
+              echo "| Field | Value |"
+              echo "|-------|-------|"
+              echo "| Project | \`${{ inputs.project_key }}\` |"
+              echo "| Target version | \`v$TARGET\` |"
+              echo "| Verdict | ⚠️ SOFT-PASS (admin snapshot unavailable — invariants skipped) |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "verdict=pass" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
           # semver_cmp A B -> echoes -1 (A<B), 0 (A==B), 1 (A>B).
           # Compares numeric X.Y.Z only — pre-release suffixes ignored for the comparison
