@@ -115,7 +115,11 @@ jobs:
         run: npm ci || npm install
 
       - name: Install Firebase CLI
-        run: npm install -g firebase-tools
+        # Pinned (was unpinned `firebase-tools`): an unpinned global install pulls
+        # firebase-tools@latest on every deploy across all 7 consumer repos, exposing
+        # the whole portfolio to ~daily upstream releases and any regression they ship.
+        # Bump deliberately after verifying a newer release deploys cleanly.
+        run: npm install -g firebase-tools@15.22.2
 
       - name: Deploy via App Hosting (main branch)
         id: deploy_apphosting_main
