@@ -156,10 +156,28 @@ jobs:
           # each backend has an Environment Name setting (Console: Backend → Settings → Environment).
           # When set, App Hosting auto-loads apphosting.<env_name>.yaml and merges it over apphosting.yaml.
           # https://firebase.google.com/docs/app-hosting/multiple-environments
-          firebase apphosting:rollouts:create "$BACKEND" \
-            --git-branch "$DEPLOY_BRANCH" \
-            --project "$FIREBASE_PROJECT_ID" \
-            --non-interactive 2>&1
+          # Transient-auth retry: firebase-tools intermittently aborts its internal SA-key
+          # token exchange with "Failed to authenticate" BEFORE any API call — the same
+          # firebase-tools version blips across consumer repos. Retry ONLY that transient
+          # failure (max 3, linear backoff). Auth fails pre-rollout, so a retry never creates
+          # a duplicate rollout; every other error exits immediately, preserving prior behavior.
+          attempt=1
+          while true; do
+            fb_log=$(mktemp)
+            set +e
+            firebase apphosting:rollouts:create "$BACKEND" \
+              --git-branch "$DEPLOY_BRANCH" \
+              --project "$FIREBASE_PROJECT_ID" \
+              --non-interactive 2>&1 | tee "$fb_log"
+            fb_status=${PIPESTATUS[0]}
+            set -e
+            [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
+            if grep -qi "Failed to authenticate" "$fb_log" && [ "$attempt" -lt 3 ]; then
+              echo "::warning::Transient firebase auth failure (attempt ${attempt}/3) — retrying in $((attempt * 20))s"
+              rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
+            fi
+            rm -f "$fb_log"; exit "$fb_status"
+          done
 
       - name: Deploy via App Hosting (branch preview)
         id: deploy_apphosting_branch
@@ -168,16 +186,46 @@ jobs:
           BACKEND="${{ inputs.app_hosting_backend }}"
           [ -z "$BACKEND" ] && BACKEND="${{ inputs.firebase_project_id }}"
           echo "Rolling out branch '${{ inputs.git_branch }}' to backend $BACKEND in project ${{ inputs.firebase_project_id }}"
-          firebase apphosting:rollouts:create "$BACKEND" \
-            --git-branch "${{ inputs.git_branch }}" \
-            --project ${{ inputs.firebase_project_id }} \
-            --non-interactive 2>&1
+          # Transient-auth retry (see "main branch" step for rationale): retry only the
+          # "Failed to authenticate" blip; all other errors fail immediately as before.
+          attempt=1
+          while true; do
+            fb_log=$(mktemp)
+            set +e
+            firebase apphosting:rollouts:create "$BACKEND" \
+              --git-branch "${{ inputs.git_branch }}" \
+              --project ${{ inputs.firebase_project_id }} \
+              --non-interactive 2>&1 | tee "$fb_log"
+            fb_status=${PIPESTATUS[0]}
+            set -e
+            [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
+            if grep -qi "Failed to authenticate" "$fb_log" && [ "$attempt" -lt 3 ]; then
+              echo "::warning::Transient firebase auth failure (attempt ${attempt}/3) — retrying in $((attempt * 20))s"
+              rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
+            fi
+            rm -f "$fb_log"; exit "$fb_status"
+          done
 
       - name: Deploy via Hosting + Functions
         if: inputs.deploy_command == 'hosting-functions'
         run: |
-          firebase deploy --non-interactive --force \
-            --project ${{ inputs.firebase_project_id }} 2>&1
+          # Transient-auth retry (see "main branch" step for rationale): retry only the
+          # "Failed to authenticate" blip; all other errors fail immediately as before.
+          attempt=1
+          while true; do
+            fb_log=$(mktemp)
+            set +e
+            firebase deploy --non-interactive --force \
+              --project ${{ inputs.firebase_project_id }} 2>&1 | tee "$fb_log"
+            fb_status=${PIPESTATUS[0]}
+            set -e
+            [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
+            if grep -qi "Failed to authenticate" "$fb_log" && [ "$attempt" -lt 3 ]; then
+              echo "::warning::Transient firebase auth failure (attempt ${attempt}/3) — retrying in $((attempt * 20))s"
+              rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
+            fi
+            rm -f "$fb_log"; exit "$fb_status"
+          done
 
       - name: Tag deployed commit
         run: |
