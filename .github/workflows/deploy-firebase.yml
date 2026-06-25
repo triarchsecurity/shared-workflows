@@ -36,16 +36,6 @@ on:
         required: false
         type: string
         default: 'prod'
-      wif_provider:
-        description: 'Full Workload Identity Federation provider resource name. When non-empty, auth uses keyless WIF (OIDC) instead of the FIREBASE_SA_KEY static key. See shared-workflows#42.'
-        required: false
-        type: string
-        default: ''
-      deploy_service_account:
-        description: 'Deploy service-account email impersonated via WIF. Required when wif_provider is set.'
-        required: false
-        type: string
-        default: ''
     secrets:
       # required:false so the canonical ci-cd.yml can be referenced by repos that
       # never deploy through it (static/FAH-native, e.g. www). GitHub validates
@@ -54,6 +44,12 @@ on:
       # Real deployers still pass the secret via inherit; the deploy step fails
       # clearly at runtime if it is genuinely absent.
       FIREBASE_SA_KEY:
+        required: false
+      FIREBASE_TOKEN:
+        # firebase login:ci refresh token. When set, the firebase CLI uses it instead of
+        # the SA-key ADC path, which intermittently fails JWT token-exchange on hosted
+        # runners ("Failed to authenticate" — clock-skew sensitive). Refresh-token auth
+        # is not JWT-signed so it sidesteps that failure. See shared-workflows#42.
         required: false
       GH_PAT:
         required: false
@@ -68,7 +64,6 @@ on:
 permissions:
   packages: read
   contents: write
-  id-token: write   # OIDC token for keyless WIF deploy auth (shared-workflows#42)
 
 jobs:
   deploy:
@@ -77,6 +72,11 @@ jobs:
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.APP_VERSION }}
+    # When FIREBASE_TOKEN is set the firebase CLI prefers it over SA-key ADC. Job-level so
+    # every firebase command in this job picks it up. Empty (secret unset) => CLI ignores it
+    # and falls back to the SA-key path, so this is a safe per-repo opt-in.
+    env:
+      FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
 
     # v7: NODE_AUTH_TOKEN uses secrets.GITHUB_TOKEN at step-level on
     # "Install project dependencies". Consumer repo must be in the npm
@@ -112,18 +112,7 @@ jobs:
           node-version: '22'
           registry-url: 'https://npm.pkg.github.com'
 
-      # Dual-path auth so repos migrate to keyless WIF one at a time (shared-workflows#42).
-      # WIF when a provider is supplied; otherwise the legacy static-key path. Both export
-      # ADC the same way, so every downstream firebase/gcloud command is unchanged.
-      - name: Authenticate to Google Cloud (WIF)
-        if: inputs.wif_provider != ''
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ inputs.wif_provider }}
-          service_account: ${{ inputs.deploy_service_account }}
-
-      - name: Authenticate to Google Cloud (key fallback)
-        if: inputs.wif_provider == ''
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.FIREBASE_SA_KEY }}
