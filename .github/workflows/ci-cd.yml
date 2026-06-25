@@ -102,6 +102,17 @@ on:
         description: 'Optional READ-ONLY DB drift check (e.g. "npm run db:check"). Empty => skipped. When set, it gates deploy. Must be read-only — never a migration (prod DATABASE_URL hazard).'
         type: string
         default: ''
+      # --- deploy auth (WIF keyless; empty => legacy FIREBASE_SA_KEY path) ---
+      wif_provider:
+        description: 'Full Workload Identity Federation provider resource name. When set, deploy auth uses keyless WIF; empty falls back to FIREBASE_SA_KEY. See shared-workflows#42.'
+        type: string
+        required: false
+        default: ''
+      deploy_service_account:
+        description: 'Deploy service-account email impersonated via WIF. Required when wif_provider is set.'
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: ci-cd-${{ github.event_name }}-${{ github.ref }}
@@ -110,6 +121,7 @@ concurrency:
 permissions:
   contents: write
   packages: read
+  id-token: write   # OIDC token for keyless WIF deploy auth (capped by consumer caller; shared-workflows#42)
 
 jobs:
   # --- GATE: PR-source enforcement (centralized; was per-repo enforce-pr-source) -
@@ -255,6 +267,8 @@ jobs:
       dev_backend: ${{ inputs.dev_backend }}
       app_url: ${{ inputs.dev_url }}
       environment: dev
+      wif_provider: ${{ inputs.wif_provider }}
+      deploy_service_account: ${{ inputs.deploy_service_account }}
     secrets: inherit
 
   # --- deploy: prod --------------------------------------------------------------
@@ -276,6 +290,8 @@ jobs:
       app_hosting_backend: ${{ inputs.app_hosting_backend }}
       app_url: ${{ inputs.prod_url }}
       environment: prod
+      wif_provider: ${{ inputs.wif_provider }}
+      deploy_service_account: ${{ inputs.deploy_service_account }}
     secrets: inherit
 
   # --- record-release: POST deploy to admin (CL-4 source data; internalized) ----
