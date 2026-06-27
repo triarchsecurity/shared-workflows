@@ -171,11 +171,18 @@ jobs:
           # each backend has an Environment Name setting (Console: Backend → Settings → Environment).
           # When set, App Hosting auto-loads apphosting.<env_name>.yaml and merges it over apphosting.yaml.
           # https://firebase.google.com/docs/app-hosting/multiple-environments
-          # Transient-auth retry: firebase-tools intermittently aborts its internal SA-key
-          # token exchange with "Failed to authenticate" BEFORE any API call — the same
-          # firebase-tools version blips across consumer repos. Retry ONLY that transient
-          # failure (max 3, linear backoff). Auth fails pre-rollout, so a retry never creates
-          # a duplicate rollout; every other error exits immediately, preserving prior behavior.
+          # Transient-deploy retry (max 3, linear backoff). Retry ONLY two known transient
+          # firebase-tools failures; exit immediately on everything else (preserves prior behavior):
+          #   1. "Failed to authenticate" — firebase-tools intermittently aborts its internal
+          #      SA-key token exchange BEFORE any API call (clock-skew/version blip). Pre-rollout,
+          #      so retrying creates no duplicate.
+          #   2. build-id 409 ("...builds/build-<date>-NNN already exists") — apphosting:rollouts:create
+          #      auto-derives a date-sequenced build id that can collide with an existing/in-flight
+          #      same-day build (notably after a failed build leaves the id taken — e.g. the
+          #      2026-06-27 tmi-dev incident: a missing secret-accessor grant failed the build,
+          #      then every redeploy 409'd on the orphaned id). A fresh invocation derives the next
+          #      id, so the retry converges. May create one extra build rolling out the same commit
+          #      (harmless, last-wins) — acceptable vs. a wedged deploy.
           attempt=1
           while true; do
             fb_log=$(mktemp)
@@ -187,8 +194,8 @@ jobs:
             fb_status=${PIPESTATUS[0]}
             set -e
             [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
-            if grep -qi "Failed to authenticate" "$fb_log" && [ "$attempt" -lt 3 ]; then
-              echo "::warning::Transient firebase auth failure (attempt ${attempt}/3) — retrying in $((attempt * 20))s"
+            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists" "$fb_log" && [ "$attempt" -lt 3 ]; then
+              echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/3) — retrying in $((attempt * 20))s"
               rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
             fi
             rm -f "$fb_log"; exit "$fb_status"
@@ -201,8 +208,9 @@ jobs:
           BACKEND="${{ inputs.app_hosting_backend }}"
           [ -z "$BACKEND" ] && BACKEND="${{ inputs.firebase_project_id }}"
           echo "Rolling out branch '${{ inputs.git_branch }}' to backend $BACKEND in project ${{ inputs.firebase_project_id }}"
-          # Transient-auth retry (see "main branch" step for rationale): retry only the
-          # "Failed to authenticate" blip; all other errors fail immediately as before.
+          # Transient-deploy retry (see "main branch" step for full rationale): retry the
+          # "Failed to authenticate" blip AND the build-id 409 collision; all other errors
+          # fail immediately as before.
           attempt=1
           while true; do
             fb_log=$(mktemp)
@@ -214,8 +222,8 @@ jobs:
             fb_status=${PIPESTATUS[0]}
             set -e
             [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
-            if grep -qi "Failed to authenticate" "$fb_log" && [ "$attempt" -lt 3 ]; then
-              echo "::warning::Transient firebase auth failure (attempt ${attempt}/3) — retrying in $((attempt * 20))s"
+            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists" "$fb_log" && [ "$attempt" -lt 3 ]; then
+              echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/3) — retrying in $((attempt * 20))s"
               rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
             fi
             rm -f "$fb_log"; exit "$fb_status"
