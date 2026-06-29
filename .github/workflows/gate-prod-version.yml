@@ -70,7 +70,7 @@ on:
         description: 'Base URL for admin control plane. Override for staging/test.'
         required: false
         type: string
-        default: 'https://admin.triarch.dev'
+        default: 'https://crm.triarchsecurity.com'
       min_dev_age_seconds:
         description: 'Minimum age of the dev deploy before prod is allowed. Default 300 (5 min) — gives any post-deploy smoke tests time to run. Set to 0 to disable.'
         required: false
