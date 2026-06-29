@@ -308,7 +308,7 @@ jobs:
             --arg releasedBy "github-actions/${GITHUB_ACTOR}" \
             '{version:$version,releaseType:$releaseType,env:$env,commitSha:$commitSha,deployedAt:$deployedAt,branch:$branch,releasedBy:$releasedBy}')
           HTTP_CODE=$(curl -s --max-time 10 -o /tmp/resp.txt -w "%{http_code}" \
-            -X POST "https://admin.triarch.dev/api/platform/ingest/release-logs" \
+            -X POST "https://crm.triarchsecurity.com/api/platform/ingest/release-logs" \
             -H "Authorization: Bearer $ADMIN_API_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
           BODY=$(head -c 400 /tmp/resp.txt 2>/dev/null || echo "")
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then

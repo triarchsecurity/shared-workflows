@@ -26,7 +26,7 @@ on:
         description: 'Base URL for admin control plane.'
         required: false
         type: string
-        default: 'https://admin.triarch.dev'
+        default: 'https://crm.triarchsecurity.com'
     secrets:
       ADMIN_API_TOKEN:
         description: 'Per-project Bearer token for admin callback.'
@@ -95,7 +95,7 @@ on:
         description: 'Admin callback base URL.'
         required: false
         type: string
-        default: 'https://admin.triarch.dev'
+        default: 'https://crm.triarchsecurity.com'
 
 # CRITICAL (RESEARCH Pitfall 4): Concurrency MUST be declared inside this workflow.
 # Concurrency on the calling workflow does NOT propagate into reusable workflows.

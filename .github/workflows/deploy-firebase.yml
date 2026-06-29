@@ -30,7 +30,7 @@ on:
         description: 'Base URL for admin control plane (admin.triarch.dev). Override for staging/test.'
         required: false
         type: string
-        default: 'https://admin.triarch.dev'
+        default: 'https://crm.triarchsecurity.com'
       environment:
         description: 'Deployment environment: dev or prod. Default prod for backwards compatibility.'
         required: false
