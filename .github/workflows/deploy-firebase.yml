@@ -202,9 +202,9 @@ jobs:
             fb_status=${PIPESTATUS[0]}
             set -e
             [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
-            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists|unable to queue the operation" "$fb_log" && [ "$attempt" -lt 3 ]; then
-              echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/3) — retrying in $((attempt * 20))s"
-              rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
+            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists|unable to queue the operation" "$fb_log" && [ "$attempt" -lt 6 ]; then
+              echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/6) — retrying in $((attempt * 45))s"
+              rm -f "$fb_log"; sleep $((attempt * 45)); attempt=$((attempt + 1)); continue
             fi
             rm -f "$fb_log"; exit "$fb_status"
           done
@@ -230,9 +230,9 @@ jobs:
             fb_status=${PIPESTATUS[0]}
             set -e
             [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
-            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists|unable to queue the operation" "$fb_log" && [ "$attempt" -lt 3 ]; then
-              echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/3) — retrying in $((attempt * 20))s"
-              rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
+            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists|unable to queue the operation" "$fb_log" && [ "$attempt" -lt 6 ]; then
+              echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/6) — retrying in $((attempt * 45))s"
+              rm -f "$fb_log"; sleep $((attempt * 45)); attempt=$((attempt + 1)); continue
             fi
             rm -f "$fb_log"; exit "$fb_status"
           done
@@ -251,9 +251,9 @@ jobs:
             fb_status=${PIPESTATUS[0]}
             set -e
             [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
-            if grep -qi "Failed to authenticate" "$fb_log" && [ "$attempt" -lt 3 ]; then
-              echo "::warning::Transient firebase auth failure (attempt ${attempt}/3) — retrying in $((attempt * 20))s"
-              rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
+            if grep -qi "Failed to authenticate" "$fb_log" && [ "$attempt" -lt 6 ]; then
+              echo "::warning::Transient firebase auth failure (attempt ${attempt}/6) — retrying in $((attempt * 45))s"
+              rm -f "$fb_log"; sleep $((attempt * 45)); attempt=$((attempt + 1)); continue
             fi
             rm -f "$fb_log"; exit "$fb_status"
           done
