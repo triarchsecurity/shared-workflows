@@ -70,6 +70,14 @@ jobs:
     name: Firebase Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Serialize deploys to the SAME backend so two job instances (re-run, duplicate trigger,
+    # or a dev+prod overlap) never race `apphosting:rollouts:create` on the same auto-derived
+    # build id. cancel-in-progress:false → an in-flight rollout finishes; the next queues behind
+    # it instead of colliding (the build-id 409 / "unable to queue" class). Belt-and-suspenders
+    # with the per-step transient-409 retry below.
+    concurrency:
+      group: deploy-firebase-${{ inputs.firebase_project_id }}-${{ inputs.environment }}-${{ inputs.app_hosting_backend }}-${{ inputs.dev_backend }}-${{ inputs.git_branch }}
+      cancel-in-progress: false
     outputs:
       version: ${{ steps.version.outputs.APP_VERSION }}
     # When FIREBASE_TOKEN is set the firebase CLI prefers it over SA-key ADC. Job-level so
@@ -194,7 +202,7 @@ jobs:
             fb_status=${PIPESTATUS[0]}
             set -e
             [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
-            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists" "$fb_log" && [ "$attempt" -lt 3 ]; then
+            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists|unable to queue the operation" "$fb_log" && [ "$attempt" -lt 3 ]; then
               echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/3) — retrying in $((attempt * 20))s"
               rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
             fi
@@ -222,7 +230,7 @@ jobs:
             fb_status=${PIPESTATUS[0]}
             set -e
             [ "$fb_status" -eq 0 ] && { rm -f "$fb_log"; break; }
-            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists" "$fb_log" && [ "$attempt" -lt 3 ]; then
+            if grep -qiE "Failed to authenticate|builds/build-[0-9-]+' already exists|unable to queue the operation" "$fb_log" && [ "$attempt" -lt 3 ]; then
               echo "::warning::Transient firebase deploy failure (auth blip or build-id collision; attempt ${attempt}/3) — retrying in $((attempt * 20))s"
               rm -f "$fb_log"; sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
             fi
