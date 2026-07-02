@@ -204,6 +204,28 @@ jobs:
             exit 0
           fi
 
+          # v9.2: DEGRADED soft-pass for reachable-but-empty snapshots. The snapshot
+          # returned 200 (fetch_ok=true) but carries NO version record for this project
+          # (dev AND prod both null/empty). That is the same audit-plane gap as an
+          # unreachable snapshot — the control plane simply has nothing to enforce against —
+          # just surfaced as an empty 200 rather than a non-200. Soft-pass with a loud
+          # warning instead of firing INV-1. NOTE: this only triggers when BOTH are empty;
+          # "prod exists but dev doesn't" still fails INV-1 below (a real regression guard).
+          if [ -z "$DEV" ] && [ -z "$PROD" ]; then
+            echo "::warning::CL-4 gate DEGRADED — admin snapshot reachable but has no dev/prod record for ${{ inputs.project_key }}; skipping INV-1..5 and soft-passing prod deploy of v$TARGET."
+            {
+              echo "## Prod Gate"
+              echo ""
+              echo "| Field | Value |"
+              echo "|-------|-------|"
+              echo "| Project | \`${{ inputs.project_key }}\` |"
+              echo "| Target version | \`v$TARGET\` |"
+              echo "| Verdict | ⚠️ SOFT-PASS (admin snapshot empty — no dev/prod record; invariants skipped) |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "verdict=pass" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           # semver_cmp A B -> echoes -1 (A<B), 0 (A==B), 1 (A>B).
           # Compares numeric X.Y.Z only — pre-release suffixes ignored for the comparison
           # (they're permitted in the regex but semver pre-release ordering is out of scope).
