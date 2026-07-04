@@ -107,6 +107,11 @@ jobs:
         if: inputs.needs_build
         env:
           BUILD_CMD: ${{ inputs.build_command }}
+          # Raise Node's heap ceiling for next-build on hosted runners (7GB RAM). Atlas hit
+          # deterministic "Ineffective mark-compacts near heap limit" OOMs at the default heap
+          # once its bundle grew (4 failures on 2026-07-04). Additive headroom only — no
+          # behavior change for repos that fit the default.
+          NODE_OPTIONS: --max-old-space-size=5120
         run: bash -c "$BUILD_CMD"
 
       - name: Start server
