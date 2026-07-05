@@ -41,6 +41,10 @@ on:
         type: boolean
         default: true
         description: 'Run Semgrep + OSV-Scanner + Gitleaks (in parallel with the gate job)'
+      conformance_enforce:
+        type: boolean
+        default: false
+        description: 'CONF-01..05 assertions. false => ::warning:: only (warn-first); true => ::error:: + fail. DO NOT flip in this phase.'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -107,6 +111,11 @@ jobs:
         if: inputs.needs_build
         env:
           BUILD_CMD: ${{ inputs.build_command }}
+          # Raise Node's heap ceiling for next-build on hosted runners (7GB RAM). Atlas hit
+          # deterministic "Ineffective mark-compacts near heap limit" OOMs at the default heap
+          # once its bundle grew (4 failures on 2026-07-04). Additive headroom only — no
+          # behavior change for repos that fit the default.
+          NODE_OPTIONS: --max-old-space-size=5120
         run: bash -c "$BUILD_CMD"
 
       - name: Start server
@@ -174,21 +183,36 @@ jobs:
             tests/**/*.md
           retention-days: 30
 
-  # ---------------------------------------------------------------- version consistency (added v9.0)
-  # Fails fast (~5s) if package.json, package-lock.json, and src/lib/version.ts
-  # (if it exists) have drifted apart. Each is a source-of-truth for the same
-  # number; humans forgetting to keep them in sync was the #2 drift issue
-  # uncovered during the 2026-05-17 framework-portability audit.
+  # --------------------------------------------------- gate checks: version-consistency + scans (v9.2)
+  # COLLAPSED (v9.2): the former `version-consistency`, `semgrep`, `osv-scanner`, and `gitleaks`
+  # JOBS are now sequential STEPS in this one `scans` job. GitHub bills per job rounded UP to a full
+  # minute, so four ~10-30s jobs cost ~4 billed minutes; as one job they cost ~2. Semgrep also moved
+  # OFF the `semgrep/semgrep:latest` Docker Hub container — its unauthenticated image pulls were
+  # timing out and failing the job at *startup* (before any step ran, so the advisory
+  # continue-on-error never applied) — ONTO a pip install from PyPI (reliable + cached).
   #
-  # The check is purely additive — if package-lock.json is missing (rare),
-  # or version.ts is missing (most repos), the corresponding assertion is
-  # silently skipped.
-  version-consistency:
-    name: version-consistency
+  # REQUIRED-CHECK MIGRATION: repos whose `main` protection required the four old contexts
+  # (`ci-cd / quality-gate / {version-consistency,semgrep,osv-scanner,gitleaks}`) must swap them for
+  # the single `ci-cd / quality-gate / scans` context, in lockstep with the release/v9 merge.
+  # `ci-cd / pr-source` and `Build, Test, Audit` are unaffected.
+  #
+  # Posture preserved EXACTLY:
+  #   - version-consistency is BLOCKING (fails the job on drift) and ALWAYS runs.
+  #   - semgrep / osv-scanner / gitleaks are ADVISORY (continue-on-error; findings surface in the
+  #     log + step summary, never fail the job) and run only when run_security_scans is true (the
+  #     dev path — skipped on main pushes and dev->main PRs, identical to before).
+  scans:
+    name: scans
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # gitleaks history scan + semgrep --baseline-ref need full history
+
+      # ---- version-consistency (BLOCKING gate, ~5s; always runs) ----
       - name: package.json ↔ package-lock.json version match
         run: |
           if [ ! -f package.json ]; then
@@ -219,8 +243,6 @@ jobs:
             exit 0
           fi
           PJ=$(node -p "require('./package.json').version" 2>/dev/null)
-          # version.ts convention: `export const APP_VERSION = 'v3.60.3'` or similar.
-          # Extract the first semver-looking string with optional 'v' prefix.
           VT_RAW=$(grep -oE "['\"]v?[0-9]+\.[0-9]+\.[0-9]+['\"]" src/lib/version.ts | head -1 | tr -d "'\"")
           VT="${VT_RAW#v}"
           if [ -z "$VT" ]; then
@@ -236,45 +258,29 @@ jobs:
           fi
           echo "package.json ($PJ) and src/lib/version.ts are in sync."
 
-  # ---------------------------------------------------------------- security scanning (added v1.7)
-  # Runs in parallel with `gate` for speed. Findings appear in the workflow log.
-  # No SARIF upload (would require GHAS / Code Security, which org Free + Team
-  # don't include for private repos). When the org acquires Code Security, add
-  # `security-events: write` to each job's permissions and append an
-  # `actions/upload-sarif` step with `continue-on-error: true` removed.
-  #
-  # These three jobs are the framework's REQUIRED status-check trio. Once your
-  # repo's main branch has run them at least once, upgrade the repo's ruleset
-  # from `main-protection-baseline.json` to `main-protection-lite.json` (which
-  # adds these as required_status_checks).
-
-  semgrep:
-    name: semgrep
-    if: inputs.run_security_scans
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # NOTE: `pull-requests: write` removed — Dependabot's push-event token
-      # is read-only on private repos and rejects this permission, causing
-      # startup_failure (`jobs: []`). Scanner output goes to workflow logs
-      # only; if you want PR comments, post-process the JSON in a separate
-      # step that runs only on push events (where `pull-requests: write`
-      # actually works), not on pull_request from Dependabot.
-    container:
-      image: semgrep/semgrep:latest
-    steps:
-      - uses: actions/checkout@v4
+      # ---- semgrep (ADVISORY; pip-installed — no Docker Hub dependency) ----
+      - name: Set up Python for semgrep
+        if: inputs.run_security_scans
+        uses: actions/setup-python@v5
         with:
-          fetch-depth: 0
-
+          python-version: '3.12'
+      - name: Cache pip downloads (semgrep wheels)
+        if: inputs.run_security_scans
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-semgrep-${{ runner.os }}-py312
       - name: Semgrep diff scan (PR) / full scan (push)
-        # SECURITY: github.base_ref must come via env: + quoted shell var, not direct
-        # ${{ }} interpolation. Direct interpolation is shell-injection-vulnerable per
-        # Semgrep rule yaml.github-actions.security.run-shell-injection.
+        if: inputs.run_security_scans
+        # ADVISORY: continue-on-error keeps the job green; findings surface as a warning + summary.
+        continue-on-error: true
+        # SECURITY: github.base_ref via env: + quoted shell var, not direct ${{ }} interpolation
+        # (avoids run-shell-injection per Semgrep rule yaml.github-actions.security.run-shell-injection).
         env:
           GH_EVENT_NAME: ${{ github.event_name }}
           GH_BASE_REF: ${{ github.base_ref }}
         run: |
+          pip install --quiet semgrep
           if [[ "$GH_EVENT_NAME" == "pull_request" ]]; then
             semgrep ci \
               --config p/ci \
@@ -292,13 +298,6 @@ jobs:
               --config p/owasp-top-ten \
               --json --output=semgrep.json || true
           fi
-
-      - name: Report Critical / High findings (advisory, non-blocking)
-        # v7.1: non-blocking. Findings surface in workflow log + step summary
-        # but do not fail the job. Matches osv-scanner posture. Re-enable
-        # blocking by removing `continue-on-error` from this step.
-        continue-on-error: true
-        run: |
           if [[ -f semgrep.json ]]; then
             high=$(jq '[.results[] | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")] | length' semgrep.json)
             if [[ "$high" -gt 0 ]]; then
@@ -311,23 +310,15 @@ jobs:
                 echo ""
                 jq -r '.results[] | select(.extra.severity=="ERROR" or .extra.severity=="WARNING") | "- `\(.check_id)` in `\(.path)`: \(.extra.message | gsub("\n"; " "))"' semgrep.json
               } >> "$GITHUB_STEP_SUMMARY"
-              exit 1   # step fails (visible), but continue-on-error keeps the job green
+            else
+              echo "no Critical/High findings"
             fi
-            echo "no Critical/High findings"
           fi
 
-  osv-scanner:
-    name: osv-scanner
-    if: inputs.run_security_scans
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
+      # ---- osv-scanner (ADVISORY) ----
       - name: Run OSV-Scanner
+        if: inputs.run_security_scans
         # google/osv-scanner-action is a monorepo; sub-action lives in /osv-scanner-action.
-        # v2 dropped --skip-git (now default behavior).
         uses: google/osv-scanner-action/osv-scanner-action@v2.3.5   # TODO: pin to commit SHA
         with:
           scan-args: |-
@@ -335,10 +326,9 @@ jobs:
             --format=json
             --output=osv.json
             ./
-        continue-on-error: true   # known vulns surface but don't block PRs; Dependabot is the remediation channel
-
+        continue-on-error: true   # known vulns surface but don't block; Dependabot is the remediation channel
       - name: Summarize OSV findings
-        if: always()
+        if: always() && inputs.run_security_scans
         run: |
           if [[ -f osv.json ]]; then
             count=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' osv.json 2>/dev/null || echo 0)
@@ -346,31 +336,18 @@ jobs:
             jq -r '.results[]?.packages[]? | "  \(.package.name)@\(.package.version): \([.vulnerabilities[].id] | join(\",\"))"' osv.json 2>/dev/null | head -30 || true
           fi
 
-  gitleaks:
-    name: gitleaks
-    if: inputs.run_security_scans
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install gitleaks (binary, not Action — Action requires paid org license)
+      # ---- gitleaks (ADVISORY; binary, Action requires a paid org license) ----
+      - name: Install gitleaks
+        if: inputs.run_security_scans
         run: |
           GITLEAKS_VERSION="8.30.1"
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp
           sudo mv /tmp/gitleaks /usr/local/bin/
-
       - name: Run gitleaks (PR diff or full repo scan, advisory)
-        # SECURITY: github.base_ref + event_name via env: + quoted shell vars
-        # (avoids run-shell-injection per Semgrep rule).
-        # v7.1: non-blocking. Findings surface as a warning + step summary
-        # but don't fail the job. Re-enable blocking by removing
-        # `continue-on-error` from this step.
+        if: inputs.run_security_scans
         continue-on-error: true
+        # SECURITY: github.base_ref + event_name via env: + quoted shell vars (avoids run-shell-injection).
         env:
           GH_EVENT_NAME: ${{ github.event_name }}
           GH_BASE_REF: ${{ github.base_ref }}
@@ -396,6 +373,44 @@ jobs:
               echo ""
               echo "See the workflow log above for redacted finding details."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 1   # step fails (visible), but continue-on-error keeps the job green
           fi
-          echo "no secrets found"
+          echo "scan complete"
+
+  # -------------------------------------------------------- CI/infra conformance (CONF-01..05, warn-first)
+  # Rides along on EVERY thin-caller PR. The checkers are single-homed in shared-workflows
+  # (AR#5 rule 2 / CONF-05) — they are NEVER copied into the caller. This job checks out the
+  # caller's tree AND the shared-workflows checker into `_conformance`, then runs the checker
+  # against the caller's workspace.
+  #
+  # WARN-FIRST: `conformance_enforce` defaults false, so findings are ::warning:: only and the
+  # job stays green (exit 0). The enforce flip (=> ::error:: + exit 1) is a SEPARATE future PR
+  # after an observation window — do NOT thread `conformance_enforce: true` from any ci-cd.yml.
+  conformance:
+    name: conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+
+      - name: Checkout shared-workflows checker
+        uses: actions/checkout@v4
+        with:
+          repository: triarchsecurity/shared-workflows
+          ref: release/v9
+          path: _conformance
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install checker deps
+        run: cd _conformance/.github/conformance && npm ci
+
+      - name: CI/infra conformance assertions (warn-first)
+        env:
+          ENFORCE: ${{ inputs.conformance_enforce }}
+        run: node _conformance/.github/conformance/check-all.mjs --target "$GITHUB_WORKSPACE"

@@ -25,7 +25,7 @@ jobs:
       EXPECTED_REF: 'ci-cd.yml@release/v9'
       # Deployable next-apps that MUST call the canonical workflow.
       DEPLOYABLE_REPOS: >-
-        security-admin security-portal platform dev-portal tmi truthtreason www darksouls trpg-platform atlas
+        security-admin security-portal platform dev-portal tmi truthtreason www darksouls trpg-platform
       GH_TOKEN: ${{ secrets.AUDIT_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
     steps:
       - name: Audit canonical adoption
