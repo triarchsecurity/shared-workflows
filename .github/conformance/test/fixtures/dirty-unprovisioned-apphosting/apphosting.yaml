@@ -1,0 +1,12 @@
+runConfig:
+  minInstances: 0
+
+env:
+  - variable: DATABASE_URL
+    secret: DATABASE_URL
+    availability:
+      - RUNTIME
+  - variable: UNPROVISIONED
+    secret: UNPROVISIONED_SECRET
+    availability:
+      - RUNTIME

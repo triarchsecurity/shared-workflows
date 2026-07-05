@@ -1,0 +1,16 @@
+name: Gated Migrate
+
+# The "5-missing-grants" incident shape: a PR adds a new secret fetch whose
+# (secret, project) pair is NOT in .conformance/ci-secret-grants.json — the CI SA
+# was never granted secretAccessor on it, so the first deploy 409-storms.
+on: workflow_dispatch
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: fetch dev secrets
+        run: |
+          DEV_URL="$(gcloud secrets versions access latest --secret=DATABASE_URL_DEV --project=triarchsecurity-atlas)"
+          NEW="$(gcloud secrets versions access latest --secret=NEW_UNGRANTED_SECRET --project=triarchsecurity-atlas)"
+          echo "fetched"

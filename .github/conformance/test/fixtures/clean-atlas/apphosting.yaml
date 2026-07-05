@@ -1,0 +1,14 @@
+runConfig:
+  minInstances: 0
+  maxInstances: 4
+
+env:
+  - variable: DATABASE_URL
+    secret: DATABASE_URL
+    availability:
+      - BUILD
+      - RUNTIME
+  - variable: SESSION_SECRET
+    secret: SESSION_SECRET
+    availability:
+      - RUNTIME

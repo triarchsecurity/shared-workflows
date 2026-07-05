@@ -1,0 +1,197 @@
+name: Test Telemetry (org-wide reusable test-run sender)
+
+# CPTEST-01 (Phase 171) — the ORG-WIDE test-run telemetry sender, generalized from atlas's
+# atlas-self sender into a `workflow_call` reusable so ANY portfolio repo can emit test-run
+# telemetry through ONE single-homed workflow (AR#5 rule 2 / CONF-05 — never copied per-repo).
+#
+# It runs the caller's test lane, computes a MACHINE-DERIVED per-run payload (test totals +
+# per-file failures + an optional tsconfig.test.json quarantine allowlist size + an optional
+# ledger-derived owned-red count — NEVER hand-curated), and POSTs it to the tenant-0 receiver
+# `POST /api/platform/ingest/test-runs` with the shared PORTFOLIO_ROLLUP_INGEST_SECRET.
+#
+# SAFE POSTURE (carried verbatim from the atlas sender — this workflow is OBSERVATIONAL, never gating):
+#   - PREFLIGHT: if the ingest secret isn't configured on the caller repo, the job SKIPS cleanly
+#     with a ::notice:: rather than going RED.
+#   - `|| true` on the test run — a test FAILURE still POSTs its results (a RED run is the truth
+#     we report); the sender NEVER aborts the calling pipeline.
+#   - HONEST DEGRADE: repos vary. Absent report / tsconfig.test.json / ledger => the corresponding
+#     field reports zeros or null, never a failure.
+#
+# SECRETS (per-repo default; an ORG-SCOPED secret is a Mike option — Open Question 3 — either
+# works with the skip-clean preflight):
+#   - PORTFOLIO_ROLLUP_INGEST_SECRET  — the shared x-ingest-secret (byte-identical to the receiver's)
+#   - PACKAGES_REGISTRY_TOKEN         — npm auth for @triarchsecurity/shared-ui (already used elsewhere)
+#
+# USAGE (from a caller, e.g. a repo's own thin workflow):
+#   jobs:
+#     telemetry:
+#       uses: triarchsecurity/shared-workflows/.github/workflows/test-telemetry.yml@release/v9
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      test_command:
+        type: string
+        default: 'npx vitest run --project=unit --reporter=json --outputFile=vitest-report.json'
+        description: 'Test command that writes the JSON report to report_path. Overridable per repo.'
+      report_path:
+        type: string
+        default: 'vitest-report.json'
+        description: 'Path to the test JSON report (vitest-shaped). Missing => zeros (honest-degrade).'
+      tsconfig_test_path:
+        type: string
+        default: 'tsconfig.test.json'
+        description: 'JSONC tsconfig whose `exclude` .test.ts(x) entries are the quarantine allowlist. Missing => null.'
+      ledger_path:
+        type: string
+        default: '.planning/phases/171B-test-lane-ops-debt-closeout-debt-run-first/171B-FIXTURE-ROT-LEDGER.md'
+        description: 'Markdown ledger whose `### N.`/`#### N.` rows enumerate owned-red tests. Missing => null.'
+      ingest_url:
+        type: string
+        default: 'https://crm.triarchsecurity.com'
+        description: 'Receiver base URL. vars.PORTFOLIO_INGEST_URL on the caller wins if set.'
+      node_version:
+        type: string
+        default: '22'
+    secrets:
+      PORTFOLIO_ROLLUP_INGEST_SECRET:
+        required: false
+      PACKAGES_REGISTRY_TOKEN:
+        required: false
+
+# One sender at a time per ref; a queued run waits (never cancel an in-flight test run mid-suite).
+concurrency:
+  group: test-telemetry-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  send:
+    name: Run tests + POST test-run telemetry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Preflight: if the ingest secret isn't configured on this repo, SKIP cleanly (never RED).
+      - name: Preflight — is the ingest secret configured?
+        id: preflight
+        env:
+          INGEST_SECRET: ${{ secrets.PORTFOLIO_ROLLUP_INGEST_SECRET }}
+        run: |
+          if [ -z "$INGEST_SECRET" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Test telemetry skipped::PORTFOLIO_ROLLUP_INGEST_SECRET not configured on this repo — skipping the test-run POST (this is not a failure). Add it (see test-telemetry.yml header) to enable."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.preflight.outputs.configured == 'true'
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+
+      - name: Install deps
+        if: steps.preflight.outputs.configured == 'true'
+        run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.PACKAGES_REGISTRY_TOKEN }}
+
+      - name: Run the test lane (JSON reporter)
+        if: steps.preflight.outputs.configured == 'true'
+        # `|| true` — a test FAILURE must still POST its results (RED is the truth we report), never abort.
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+        run: bash -c "$TEST_COMMAND" || true
+
+      - name: Build + POST the machine-derived test-run payload
+        if: steps.preflight.outputs.configured == 'true'
+        env:
+          INGEST_URL: ${{ vars.PORTFOLIO_INGEST_URL || inputs.ingest_url }}
+          INGEST_SECRET: ${{ secrets.PORTFOLIO_ROLLUP_INGEST_SECRET }}
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          REPORT_PATH: ${{ inputs.report_path }}
+          TSCONFIG_TEST_PATH: ${{ inputs.tsconfig_test_path }}
+          LEDGER_PATH: ${{ inputs.ledger_path }}
+        run: |
+          set -euo pipefail
+          # MACHINE-DERIVED payload — NEVER hand-curated. Parse the test JSON for totals + per-file
+          # failures, the tsconfig.test.json `exclude` allowlist for the quarantine count, and the
+          # ledger's enumerated owned-red rows. Every source honest-degrades if absent (portability).
+          node <<'NODE' > payload.json
+          const fs = require('fs');
+
+          // --- test results (default to an honest zero shape if the report is missing) ---
+          let total = 0, passed = 0, failed = 0, skipped = 0;
+          const fileFailures = [];
+          try {
+            const rep = JSON.parse(fs.readFileSync(process.env.REPORT_PATH, 'utf8'));
+            total = rep.numTotalTests ?? 0;
+            passed = rep.numPassedTests ?? 0;
+            failed = rep.numFailedTests ?? 0;
+            skipped = (rep.numPendingTests ?? 0) + (rep.numTodoTests ?? 0);
+            for (const f of rep.testResults ?? []) {
+              const fc = (f.assertionResults ?? []).filter((a) => a.status === 'failed').length;
+              if (fc > 0) fileFailures.push({ file: f.name, failedCount: fc });
+            }
+          } catch (e) {
+            console.error('test report parse failed (reporting zeros):', e.message);
+          }
+
+          // --- quarantineCount = the tsconfig.test.json `exclude` test-file entries (optional) ---
+          let quarantineCount = null;
+          try {
+            const raw = fs
+              .readFileSync(process.env.TSCONFIG_TEST_PATH, 'utf8')
+              .replace(/\/\/.*$/gm, '')       // strip line comments (JSONC)
+              .replace(/,(\s*[\]}])/g, '$1'); // strip trailing commas
+            const tj = JSON.parse(raw);
+            quarantineCount = (tj.exclude ?? []).filter((x) => /\.test\.tsx?$/.test(x)).length;
+          } catch (e) {
+            console.error('tsconfig.test.json parse failed (null):', e.message);
+          }
+
+          // --- ownedRedCount = enumerated owned-red rows in the ledger (^### N. / ^#### N.) (optional) ---
+          let ownedRedCount = null;
+          try {
+            const led = fs.readFileSync(process.env.LEDGER_PATH, 'utf8');
+            ownedRedCount = (led.match(/^#{3,4} [0-9]+\./gm) ?? []).length;
+          } catch (e) {
+            console.error('ledger parse failed (null):', e.message);
+          }
+
+          const payload = {
+            repo: process.env.REPO,
+            runId: String(process.env.RUN_ID),
+            commitSha: process.env.COMMIT_SHA || null,
+            branch: process.env.BRANCH || null,
+            runStartedAt: new Date().toISOString(),
+            total,
+            passed,
+            failed,
+            skipped,
+            fileFailures,
+            quarantineCount,
+            ownedRedCount,
+          };
+          process.stdout.write(JSON.stringify(payload));
+          NODE
+
+          # Echo the derived COUNTS only (never the secret, never the payload body verbatim).
+          node -e 'const p=require("./payload.json");console.log("Derived:", JSON.stringify({repo:p.repo,total:p.total,passed:p.passed,failed:p.failed,skipped:p.skipped,quarantineCount:p.quarantineCount,ownedRedCount:p.ownedRedCount,failingFiles:p.fileFailures.length}))'
+
+          # POST to the tenant-0 receiver; the secret rides the header ONLY (never echoed).
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "${INGEST_URL%/}/api/platform/ingest/test-runs" \
+            -H "content-type: application/json" \
+            -H "x-ingest-secret: ${INGEST_SECRET}" \
+            --data-binary @payload.json)
+          echo "Receiver responded: HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::warning title=Test telemetry POST non-200::the test-runs receiver returned HTTP $code"
+          fi
