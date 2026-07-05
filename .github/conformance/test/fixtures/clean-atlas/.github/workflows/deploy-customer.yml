@@ -1,0 +1,14 @@
+name: Deploy Customer
+
+# Manual customer-project deploy. CUSTOMER_FIREBASE_SA_KEY is a distinct SA key
+# (customer project) admin/portal lack — a regulated secret-source, exemptioned.
+on: workflow_dispatch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: deploy
+        env:
+          SA_KEY: ${{ secrets.CUSTOMER_FIREBASE_SA_KEY }}
+        run: echo "deploy to customer project"

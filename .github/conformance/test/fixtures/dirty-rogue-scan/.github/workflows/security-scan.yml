@@ -1,0 +1,15 @@
+name: Security Scan
+
+# The retired D-1 shape: a bespoke per-repo scan workflow. Centralized scans
+# (semgrep/osv/gitleaks) live in shared-workflows quality-gate.yml. A per-repo
+# scan file with no exemption is exactly the drift CONF-02 exists to catch.
+on: pull_request
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: semgrep
+        run: semgrep ci
+      - name: osv-scanner
+        run: osv-scanner -r .

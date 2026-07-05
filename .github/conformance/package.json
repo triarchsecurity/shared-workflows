@@ -1,0 +1,12 @@
+{
+  "name": "conformance",
+  "private": true,
+  "type": "module",
+  "description": "CI/infra conformance checkers (AR#5 rules 1 & 2 mechanized). Pure Node, zero-dep node --test harness. Lives ONLY here in shared-workflows (CONF-05), never copied per-repo.",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "js-yaml": "^4.1.0"
+  }
+}
