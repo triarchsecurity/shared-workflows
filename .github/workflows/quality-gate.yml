@@ -41,6 +41,10 @@ on:
         type: boolean
         default: true
         description: 'Run Semgrep + OSV-Scanner + Gitleaks (in parallel with the gate job)'
+      conformance_enforce:
+        type: boolean
+        default: false
+        description: 'CONF-01..05 assertions. false => ::warning:: only (warn-first); true => ::error:: + fail. DO NOT flip in this phase.'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -371,3 +375,42 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "scan complete"
+
+  # -------------------------------------------------------- CI/infra conformance (CONF-01..05, warn-first)
+  # Rides along on EVERY thin-caller PR. The checkers are single-homed in shared-workflows
+  # (AR#5 rule 2 / CONF-05) — they are NEVER copied into the caller. This job checks out the
+  # caller's tree AND the shared-workflows checker into `_conformance`, then runs the checker
+  # against the caller's workspace.
+  #
+  # WARN-FIRST: `conformance_enforce` defaults false, so findings are ::warning:: only and the
+  # job stays green (exit 0). The enforce flip (=> ::error:: + exit 1) is a SEPARATE future PR
+  # after an observation window — do NOT set conformance_enforce=true from any ci-cd.yml yet.
+  conformance:
+    name: conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+
+      - name: Checkout shared-workflows checker
+        uses: actions/checkout@v4
+        with:
+          repository: triarchsecurity/shared-workflows
+          ref: release/v9
+          path: _conformance
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install checker deps
+        run: cd _conformance/.github/conformance && npm ci
+
+      - name: CI/infra conformance assertions (warn-first)
+        env:
+          ENFORCE: ${{ inputs.conformance_enforce }}
+        run: node _conformance/.github/conformance/check-all.mjs --target "$GITHUB_WORKSPACE"

@@ -1,0 +1,19 @@
+name: Gated Migrate
+
+# WIF-authed, gated Secret-Manager-read migrate. The WIF stack is a regulated
+# secret/auth source admin/portal lack — justified via .conformance/exemptions.yaml.
+on: workflow_dispatch
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_CI_SERVICE_ACCOUNT }}
+      - name: fetch dev secrets
+        run: |
+          DEV_URL="$(gcloud secrets versions access latest --secret=DATABASE_URL_DEV --project=triarchsecurity-atlas)"
+          BLIND_INDEX_KEY="$(gcloud secrets versions access latest --secret=BLIND_INDEX_KEY_DEV --project=triarchsecurity-atlas)"
+          echo "fetched"

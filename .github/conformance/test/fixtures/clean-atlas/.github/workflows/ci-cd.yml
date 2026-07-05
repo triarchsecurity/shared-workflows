@@ -1,0 +1,29 @@
+name: Atlas CI/CD
+
+# Thin caller of the canonical pipeline. Triggers on [main, dev] only — portal
+# additionally lists release/**, hotfix/**. CONF-04 treats that trigger-set gap
+# as a SOFT (advisory) finding, never a hard fail.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+    branches: [main, dev]
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  ci-cd:
+    uses: triarchsecurity/shared-workflows/.github/workflows/ci-cd.yml@release/v9
+    with:
+      app_type: next-app
+      project_key: atlas
+      firebase_project_id: triarchsecurity-atlas
+      app_hosting_backend: atlas
+      dev_backend: atlas-dev
+      prod_url: https://atlas.triarchsecurity.com
+      dev_url: https://atlas-dev.triarchsecurity.com
+      project_name: Atlas
+    secrets: inherit

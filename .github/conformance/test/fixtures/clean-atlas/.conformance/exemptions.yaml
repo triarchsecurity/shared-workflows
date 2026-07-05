@@ -1,0 +1,10 @@
+# Sanctioned per-repo deviations (CONF-02). Each entry is the durable, PR-body-free
+# justification for a regulated-class workflow admin/portal lack.
+- workflow: migrate.yml
+  class: wif
+  reason: Gated Secret-Manager-read migrate; WIF is the CI-SA auth path the canonical FIREBASE_SA_KEY flow lacks.
+  ar5_ref: AR#5 rule 1
+- workflow: deploy-customer.yml
+  class: secret-source
+  reason: CUSTOMER_FIREBASE_SA_KEY is a distinct customer-project deploy key, isolated from tenant-0.
+  ar5_ref: AR#5 rule 1

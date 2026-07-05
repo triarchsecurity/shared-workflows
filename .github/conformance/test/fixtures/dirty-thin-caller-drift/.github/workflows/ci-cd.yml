@@ -1,0 +1,24 @@
+name: Atlas CI/CD (drifted)
+
+# The thin-caller-drift shape: a SECOND job, an inline run: step in the caller,
+# and a stale @release/v8 ref. CONF-04 must flag all three.
+on:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  ci-cd:
+    uses: triarchsecurity/shared-workflows/.github/workflows/ci-cd.yml@release/v8
+    with:
+      app_type: next-app
+      project_key: atlas
+    secrets: inherit
+  bespoke-extra:
+    runs-on: ubuntu-latest
+    steps:
+      - name: inline bespoke logic
+        run: echo "this belongs in shared-workflows, not a per-repo caller"

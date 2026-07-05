@@ -1,0 +1,30 @@
+name: Triarch Portal CI/CD
+
+# Thin caller of the canonical pipeline (shared-workflows ci-cd.yml). Tracks the
+# moving release/v9 ref so flow changes propagate automatically.
+# This is the GOLDEN thin-caller shape (CONF-04 clean): one job, @release/v9,
+# secrets: inherit, no inline steps/run, full canonical trigger set.
+on:
+  push:
+    branches: [main, dev, 'release/**', 'hotfix/**']
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+    branches: [main, dev]
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  ci-cd:
+    uses: triarchsecurity/shared-workflows/.github/workflows/ci-cd.yml@release/v9
+    with:
+      app_type: next-app
+      project_key: triarchsecurity-portal
+      firebase_project_id: triarchsecurity-portal
+      app_hosting_backend: triarchsecurity-portal
+      dev_backend: portal-dev
+      prod_url: https://portal.triarchsecurity.com
+      dev_url: https://portal-dev.triarchsecurity.com
+      project_name: Triarch Portal
+    secrets: inherit

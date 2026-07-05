@@ -1,0 +1,61 @@
+# Cross-repo conformance baseline (CONF-02 + CONF-04).
+#
+# The admin/portal SANCTIONED workflow set + the class taxonomy that CONF-02
+# uses to decide whether a per-repo workflow needs an exemption.
+#
+# PITFALL 2 (do not regress): admin is NOT a "only ci-cd.yml" baseline. It
+# legitimately carries app crons + the shared-ui publisher + a structural guard.
+# CONF-02 therefore classifies by KIND, never by count. Only the regulated
+# classes (gate/scan/pat/wif/secret-source) require justification when they are
+# not already present in an admin/portal sanctioned workflow.
+
+# Sanctioned workflow filenames — present in the canonical repos, no exemption needed.
+portal_sanctioned:
+  - ci-cd.yml
+admin_sanctioned:
+  - ci-cd.yml
+  - email-crawl-cron.yml
+  - fix-bug.yml
+  - gcp-billing-cron.yml
+  - granola-cron.yml
+  - mercury-cron.yml
+  - publish-shared-ui.yml
+  - stat07-guard.yml
+
+# Classes that need NO exemption (allowed in any deployable repo).
+allowed_classes:
+  - app-cron
+  - structural-guard
+
+# Classes that REQUIRE a checked-in exemption when the carrying workflow is not
+# in the admin/portal sanctioned set (AR#5 rule 1 mechanized).
+regulated_classes:
+  - gate
+  - scan
+  - pat
+  - wif
+  - secret-source
+
+# CONF-04 — the canonical thin-caller ref every ci-cd.yml must pin.
+canonical_ref: ci-cd.yml@release/v9
+
+# CONF-04 — the canonical workflow_call input set. Any `with:` key outside this
+# set in a consumer ci-cd.yml is drift.
+canonical_inputs:
+  - app_type
+  - project_key
+  - firebase_project_id
+  - app_hosting_backend
+  - dev_backend
+  - prod_url
+  - dev_url
+  - project_name
+  - node_version
+  - build_command
+  - deploy_command
+  - run_qa_tests
+  - run_pentest
+  - needs_server
+  - deploy_in_workflow
+  - record_release
+  - db_check_command
