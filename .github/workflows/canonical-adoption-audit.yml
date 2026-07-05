@@ -24,10 +24,27 @@ jobs:
       ORG: triarchsecurity
       EXPECTED_REF: 'ci-cd.yml@release/v9'
       # Deployable next-apps that MUST call the canonical workflow.
+      # NOTE (171-02): `atlas` added here. It IS on `main` (PR #37) but was absent from
+      # release/v9 — enrolled here so the release/v9 audit covers it. Flag for Mike: confirm
+      # main<->release/v9 DEPLOYABLE_REPOS parity when promoting.
       DEPLOYABLE_REPOS: >-
-        security-admin security-portal platform dev-portal tmi truthtreason www darksouls trpg-platform
+        security-admin security-portal platform dev-portal tmi truthtreason www darksouls trpg-platform atlas
       GH_TOKEN: ${{ secrets.AUDIT_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
     steps:
+      # The cross-repo conformance step (below) reuses the SAME checkers that ride each PR
+      # (AR#5 rule 2 / CONF-05: single-homed here in shared-workflows, never copied). Check out
+      # this repo + install the checker deps so the audit can run them against fetched repo trees.
+      - name: Checkout shared-workflows checker
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install checker deps
+        run: cd .github/conformance && npm ci
+
       - name: Audit canonical adoption
         id: audit
         run: |
@@ -92,3 +109,91 @@ jobs:
         run: |
           echo "::error::Canonical adoption drift detected — see the job summary."
           exit 1
+
+      # ------------------------------------------ cross-repo conformance (CONF-02/04, warn-first)
+      # Reuse the SAME shared checkers cross-repo. For each deployable repo, materialize a minimal
+      # target tree (ci-cd.yml + all .github/workflows + .conformance/exemptions.yaml) from the
+      # GitHub API and run the checker at ENFORCE=false. CONF-02 (deviation) + CONF-04 (thin-caller
+      # shape) run on static content; CONF-01/03 honest-degrade (their manifests aren't fetched
+      # here — the live secret/IAM diff is deferred, see the disabled step below).
+      #
+      # WARN-FIRST: findings accumulate into the step summary + an advisory Slack note but NEVER
+      # exit 1. Only canonical @release/v9 ref drift (above) fails the audit this phase.
+      - name: Cross-repo conformance assertions (warn-first)
+        id: conformance
+        run: |
+          set -uo pipefail
+          findings=""
+          for repo in $DEPLOYABLE_REPOS; do
+            tmp="$(mktemp -d)"
+            mkdir -p "$tmp/.github/workflows" "$tmp/.conformance"
+            # ci-cd.yml
+            if b64=$(gh api "repos/$ORG/$repo/contents/.github/workflows/ci-cd.yml" --jq '.content' 2>/dev/null); then
+              echo "$b64" | base64 -d > "$tmp/.github/workflows/ci-cd.yml" 2>/dev/null || true
+            fi
+            # all workflow files (needed by CONF-02 deviation classification)
+            if names=$(gh api "repos/$ORG/$repo/contents/.github/workflows" --jq '.[].name' 2>/dev/null); then
+              while IFS= read -r name; do
+                [ -z "$name" ] && continue
+                case "$name" in *.yml|*.yaml) ;; *) continue ;; esac
+                if wb64=$(gh api "repos/$ORG/$repo/contents/.github/workflows/$name" --jq '.content' 2>/dev/null); then
+                  echo "$wb64" | base64 -d > "$tmp/.github/workflows/$name" 2>/dev/null || true
+                fi
+              done <<< "$names"
+            fi
+            # .conformance/exemptions.yaml (optional; absent => no exemptions, honest-degrade)
+            if eb64=$(gh api "repos/$ORG/$repo/contents/.conformance/exemptions.yaml" --jq '.content' 2>/dev/null); then
+              echo "$eb64" | base64 -d > "$tmp/.conformance/exemptions.yaml" 2>/dev/null || true
+            fi
+            # Run the shared checker warn-first. Suppress the checker's own step-summary append
+            # (empty GITHUB_STEP_SUMMARY) so we aggregate per-repo output ourselves.
+            out=$(ENFORCE=false GITHUB_STEP_SUMMARY="" node .github/conformance/check-all.mjs --target "$tmp" 2>&1 || true)
+            repo_warnings=$(echo "$out" | grep '::warning::' || true)
+            if [ -n "$repo_warnings" ]; then
+              findings="${findings}\n### ${repo}\n$(echo "$repo_warnings" | sed 's/::warning:://; s/^/- /')"
+            fi
+            rm -rf "$tmp"
+          done
+
+          {
+            echo "## Cross-repo conformance (CONF-02/04, warn-first — advisory)"
+            if [ -z "$findings" ]; then
+              echo "✅ No static conformance findings across deployable repos."
+            else
+              echo "⚠️ Advisory conformance findings (NOT blocking — enforce flip is a future PR):"
+              echo -e "$findings"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          { echo "findings<<EOF"; echo -e "$findings"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+
+      - name: Slack advisory on conformance findings
+        if: steps.conformance.outputs.findings != ''
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          FINDINGS: ${{ steps.conformance.outputs.findings }}
+        run: |
+          if [ -z "${SLACK_BOT_TOKEN:-}" ] || [ -z "${SLACK_CHANNEL_ID:-}" ]; then
+            echo "::warning::Slack secrets absent — conformance findings not posted (see step summary)."; exit 0
+          fi
+          text=$(printf ':information_source: *Cross-repo CI/infra conformance (advisory, warn-first)*%b\n\nThese are CONF-02/04 findings — NOT blocking. Enforce flip is a separate future PR.' "$FINDINGS")
+          curl -s -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d "$(jq -n --arg c "$SLACK_CHANNEL_ID" --arg t "$text" '{channel:$c, text:$t}')" >/dev/null || true
+
+      # -------------------------- CONF-01/03 LIVE checks (secret existence + real IAM) — DEFERRED
+      # These require an audit service-account with `secretmanager.secrets.list` +
+      # `getIamPolicy` across every tenant project — a NEW privileged identity that admin/portal
+      # do NOT have (AR#5 rule 1: no new IAM without justification; Open Question 2, operator
+      # long-lead). Until Mike provisions that SA, only the pure static CONF-02/04 checks (above)
+      # run cross-repo. This placeholder documents the deferral; it never executes (`if: false`).
+      - name: CONF-01/03 live secret + IAM diff (DISABLED — needs audit SA)
+        if: false
+        run: |
+          echo "::notice::CONF-01/03 live checks are deferred pending an audit service-account with secretmanager.secrets.list + getIamPolicy. No IAM provisioned in this PR."
+          # Intended (once the SA exists):
+          #   gcloud secrets list --project=<p> --format='value(name)'   # CONF-03 existence
+          #   gcloud ... getIamPolicy                                     # CONF-01 real grants
+          exit 0

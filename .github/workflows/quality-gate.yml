@@ -384,7 +384,7 @@ jobs:
   #
   # WARN-FIRST: `conformance_enforce` defaults false, so findings are ::warning:: only and the
   # job stays green (exit 0). The enforce flip (=> ::error:: + exit 1) is a SEPARATE future PR
-  # after an observation window — do NOT thread `conformance_enforce: true` from any ci-cd.yml.
+  # after an observation window — do NOT set conformance_enforce=true from any ci-cd.yml yet.
   conformance:
     name: conformance
     runs-on: ubuntu-latest
