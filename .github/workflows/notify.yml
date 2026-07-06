@@ -82,22 +82,20 @@ jobs:
       # the Slack notification. The wait is a nice-to-have signal — if any
       # part of it (auth, CLI install, polling) fails, we fall back to the
       # GH workflow's `status` input and Slack still fires.
+      # v1.7: the FAH poll is a direct REST call against
+      # firebaseapphosting.googleapis.com using the auth step's access token.
+      # The previous CLI path (Set up Cloud SDK ~20s + npm install -g
+      # firebase-tools ~36s, on EVERY deploy of EVERY repo) burned ~1 min of
+      # Actions time per run purely as tooling setup for one list call — the
+      # CLI wraps this same endpoint. No SDK, no npm install.
       - name: Authenticate to Google Cloud
+        id: gcp-auth
         if: inputs.wait_for_fah && inputs.firebase_project_id != ''
         continue-on-error: true
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.FIREBASE_SA_KEY }}
-
-      - name: Set up Cloud SDK
-        if: inputs.wait_for_fah && inputs.firebase_project_id != ''
-        continue-on-error: true
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Install Firebase CLI
-        if: inputs.wait_for_fah && inputs.firebase_project_id != ''
-        continue-on-error: true
-        run: npm install -g firebase-tools
+          token_format: 'access_token'
 
       - name: Wait for FAH rollout
         id: fah-wait
@@ -107,37 +105,46 @@ jobs:
           BACKEND: ${{ inputs.app_hosting_backend != '' && inputs.app_hosting_backend || inputs.firebase_project_id }}
           PROJECT: ${{ inputs.firebase_project_id }}
           TIMEOUT: ${{ inputs.fah_timeout_seconds }}
+          GCP_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
         run: |
           # No `set -e` — every command is allowed to fail without aborting
           # the script. Each potential-failure path uses `|| true` and we
           # always `exit 0` at the end. This is "best-effort" telemetry.
           set +e
 
+          if [ -z "$GCP_TOKEN" ]; then
+            echo "::warning::No GCP access token (auth step failed or FIREBASE_SA_KEY missing) — proceeding without FAH wait"
+            echo "FAH_STATE=UNKNOWN" >> $GITHUB_OUTPUT
+            echo "FAH_DURATION=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           echo "Warmup: waiting 15s for FAH to enqueue the new rollout..."
           sleep 15
 
-          # The firebase CLI's --json flag isn't supported on all subcommands.
-          # Try JSON first; if jq parse fails, fall back to text parsing.
+          # Direct REST — the same API the firebase CLI wraps. rollouts.list
+          # does NOT accept the locations/- wildcard (400, live-verified), so
+          # resolve the backend's region first via the aggregated backends
+          # list (which DOES support the wildcard), defaulting to us-central1.
+          # The API returns rollouts newest-first (same ordering the CLI's
+          # .[0] relied on).
+          BASE="https://firebaseapphosting.googleapis.com/v1/projects/${PROJECT}"
+          LOCATION=$(curl -sS --max-time 15 -H "Authorization: Bearer $GCP_TOKEN" \
+            "${BASE}/locations/-/backends" 2>/dev/null \
+            | jq -r --arg B "$BACKEND" \
+              '.backends[]? | select((.name | split("/") | last) == $B) | .name | split("/")[3]' 2>/dev/null | head -1)
+          LOCATION="${LOCATION:-us-central1}"
+          echo "Backend $BACKEND location: $LOCATION"
+
+          API="${BASE}/locations/${LOCATION}/backends/${BACKEND}/rollouts"
           fetch_rollouts() {
-            firebase apphosting:rollouts:list "$BACKEND" --project "$PROJECT" --json 2>/dev/null
-          }
-          fetch_rollouts_text() {
-            firebase apphosting:rollouts:list "$BACKEND" --project "$PROJECT" 2>/dev/null
+            curl -sS --max-time 15 -H "Authorization: Bearer $GCP_TOKEN" "${API}?pageSize=5" 2>/dev/null
           }
 
-          # Try JSON path
-          ROLLOUT=$(fetch_rollouts | jq -r '.[0].name // empty' 2>/dev/null)
-
-          # Fall back to text parsing — first non-header line, first col is the name
-          if [ -z "$ROLLOUT" ]; then
-            ROLLOUT=$(fetch_rollouts_text \
-              | grep -E '^projects/' \
-              | head -1 \
-              | awk '{print $1}')
-          fi
+          ROLLOUT=$(fetch_rollouts | jq -r '.rollouts[0].name // empty' 2>/dev/null)
 
           if [ -z "$ROLLOUT" ]; then
-            echo "::warning::Could not identify FAH rollout for $BACKEND (firebase CLI may not support apphosting:rollouts on this version, or backend has no rollouts) — proceeding without wait"
+            echo "::warning::Could not identify FAH rollout for $BACKEND (REST list returned none, or the request failed) — proceeding without wait"
             echo "FAH_STATE=UNKNOWN" >> $GITHUB_OUTPUT
             echo "FAH_DURATION=0" >> $GITHUB_OUTPUT
             exit 0
@@ -156,12 +163,7 @@ jobs:
             fi
 
             STATE=$(fetch_rollouts \
-              | jq -r --arg N "$ROLLOUT" '.[] | select(.name == $N) | .state // "UNKNOWN"' 2>/dev/null)
-            if [ -z "$STATE" ] || [ "$STATE" = "UNKNOWN" ]; then
-              # Text fallback — locate the rollout line, second column is state
-              STATE=$(fetch_rollouts_text \
-                | awk -v r="$ROLLOUT" '$1 == r { print $2 }')
-            fi
+              | jq -r --arg N "$ROLLOUT" '.rollouts[]? | select(.name == $N) | .state // "UNKNOWN"' 2>/dev/null)
             STATE="${STATE:-UNKNOWN}"
 
             case "$STATE" in
