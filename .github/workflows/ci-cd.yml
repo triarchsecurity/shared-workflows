@@ -293,6 +293,7 @@ jobs:
           ADMIN_API_TOKEN: ${{ secrets.ADMIN_API_TOKEN }}
           ENV_NAME: ${{ needs.env-select.outputs.environment }}
           VERSION: ${{ needs.version.outputs.version }}
+          PROJECT_KEY: ${{ inputs.project_key }}
           GH_SHA: ${{ github.sha }}
           REF: ${{ github.ref }}
         run: |
@@ -302,14 +303,20 @@ jobs:
           BRANCH="${REF#refs/heads/}"
           DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           if echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.0$'; then RTYPE="minor"; else RTYPE="patch"; fi
+          # project rides the payload for an explicit receiver cross-check; the receiver ALSO derives
+          # it from the Bearer apiKey (2026-07-05 dual-auth fix — this POST had 401'd since v8: the
+          # receiver only took x-ingest-secret, so release_logs stayed EMPTY for every repo).
           PAYLOAD=$(jq -n \
+            --arg project "$PROJECT_KEY" \
             --arg version "v$VERSION" --arg releaseType "$RTYPE" --arg env "$ENV_NAME" \
             --arg commitSha "$GH_SHA" --arg deployedAt "$DEPLOYED_AT" --arg branch "$BRANCH" \
             --arg releasedBy "github-actions/${GITHUB_ACTOR}" \
-            '{version:$version,releaseType:$releaseType,env:$env,commitSha:$commitSha,deployedAt:$deployedAt,branch:$branch,releasedBy:$releasedBy}')
-          HTTP_CODE=$(curl -s --max-time 10 -o /tmp/resp.txt -w "%{http_code}" \
+            '{project:$project,version:$version,releaseType:$releaseType,env:$env,commitSha:$commitSha,deployedAt:$deployedAt,branch:$branch,releasedBy:$releasedBy}')
+          # --retry + the "000" fallback: a mid-rollout blip (the receiving instance restarts as this
+          # fires) must degrade to the warning path, never hard-fail the job (2026-07-05: curl exit 28).
+          HTTP_CODE=$(curl -s --max-time 15 --retry 3 --retry-all-errors -o /tmp/resp.txt -w "%{http_code}" \
             -X POST "https://crm.triarchsecurity.com/api/platform/ingest/release-logs" \
-            -H "Authorization: Bearer $ADMIN_API_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD")
+            -H "Authorization: Bearer $ADMIN_API_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD" || echo "000")
           BODY=$(head -c 400 /tmp/resp.txt 2>/dev/null || echo "")
           if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
             echo "✓ Release recorded (HTTP $HTTP_CODE): $BODY"
