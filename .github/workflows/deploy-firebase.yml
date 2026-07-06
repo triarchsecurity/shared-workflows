@@ -114,31 +114,35 @@ jobs:
           echo "APP_VERSION=$VER" >> $GITHUB_OUTPUT
           echo "Extracted version: $VER"
 
-      - name: Set up Node.js
+      # Auth mints an access_token (token_format) for the REST rollout path AND still writes the ADC
+      # credentials file (create_credentials_file defaults true) so the firebase-tools CLI FALLBACK
+      # keeps working. setup-gcloud is GONE — the REST path uses curl, and firebase-tools carries its
+      # own auth; neither needs the gcloud CLI (~20s saved per deploy of every repo).
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SA_KEY }}
+          token_format: 'access_token'
+
+      # Node + project deps are needed ONLY by the hosting-functions deploy path (firebase deploy runs
+      # the repo's predeploy build). The apphosting path builds SERVER-SIDE from the git commit and
+      # needs no local node_modules — its unconditional setup-node/npm ci/firebase-tools installs (the
+      # ~min-per-deploy tooling tax on every apphosting repo) are removed. The apphosting REST path uses
+      # system node/curl; its CLI fallback installs firebase-tools inline only when it actually fires.
+      - name: Set up Node.js (hosting-functions only)
+        if: inputs.deploy_command == 'hosting-functions'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           registry-url: 'https://npm.pkg.github.com'
+          cache: 'npm'
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.FIREBASE_SA_KEY }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
-
-      - name: Install project dependencies
+      - name: Install project dependencies (hosting-functions only)
+        if: inputs.deploy_command == 'hosting-functions'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm ci || npm install
-
-      - name: Install Firebase CLI
-        # Pinned (was unpinned `firebase-tools`): an unpinned global install pulls
-        # firebase-tools@latest on every deploy across all 7 consumer repos, exposing
-        # the whole portfolio to ~daily upstream releases and any regression they ship.
-        # Bump deliberately after verifying a newer release deploys cleanly.
-        run: npm install -g firebase-tools@15.22.2
 
       - name: Deploy via App Hosting (main branch)
         id: deploy_apphosting_main
@@ -149,6 +153,10 @@ jobs:
           APP_HOSTING_BACKEND: ${{ inputs.app_hosting_backend }}
           DEV_BACKEND: ${{ inputs.dev_backend }}
           INPUT_GIT_BRANCH: ${{ inputs.git_branch }}
+          GCP_TOKEN: ${{ steps.auth.outputs.access_token }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           # v5: resolve backend with explicit dev_backend support (no more "-dev" auto-suffix
           # when the caller has supplied an explicit dev backend name).
@@ -174,23 +182,93 @@ jobs:
           if [ "$ENVIRONMENT" = "dev" ] && [ "$DEPLOY_BRANCH" = "main" ]; then
             DEPLOY_BRANCH="dev"
           fi
-          echo "Rolling out branch '$DEPLOY_BRANCH' to backend $BACKEND (env=$ENVIRONMENT) in project $FIREBASE_PROJECT_ID"
+          echo "Rolling out backend $BACKEND (env=$ENVIRONMENT) in project $FIREBASE_PROJECT_ID"
           # Per-environment yaml selection is handled by Firebase App Hosting at build time:
           # each backend has an Environment Name setting (Console: Backend → Settings → Environment).
           # When set, App Hosting auto-loads apphosting.<env_name>.yaml and merges it over apphosting.yaml.
           # https://firebase.google.com/docs/app-hosting/multiple-environments
-          # Transient-deploy retry (max 3, linear backoff). Retry ONLY two known transient
-          # firebase-tools failures; exit immediately on everything else (preserves prior behavior):
-          #   1. "Failed to authenticate" — firebase-tools intermittently aborts its internal
-          #      SA-key token exchange BEFORE any API call (clock-skew/version blip). Pre-rollout,
-          #      so retrying creates no duplicate.
-          #   2. build-id 409 ("...builds/build-<date>-NNN already exists") — apphosting:rollouts:create
-          #      auto-derives a date-sequenced build id that can collide with an existing/in-flight
-          #      same-day build (notably after a failed build leaves the id taken — e.g. the
-          #      2026-06-27 tmi-dev incident: a missing secret-accessor grant failed the build,
-          #      then every redeploy 409'd on the orphaned id). A fresh invocation derives the next
-          #      id, so the retry converges. May create one extra build rolling out the same commit
-          #      (harmless, last-wins) — acceptable vs. a wedged deploy.
+          #
+          # ── PRIMARY: direct REST (no firebase-tools install; ~min saved per deploy) ──────────────
+          # Live-verified against the API discovery doc + a real atlas-dev rollout (2026-07-06): the
+          # Rollout.build field is REQUIRED + immutable and the git ref lives on the BUILD, not the
+          # rollout — so the CLI's one-shot `--git-branch` is two REST calls: builds.create(codebase)
+          # then rollouts.create(build). We deploy the EXACT triggering commit (github.sha), which for a
+          # dev/main push equals that branch's HEAD (identical to the CLI's --git-branch latest-commit).
+          run_rest_deploy() {
+            [ -z "$GCP_TOKEN" ] && { echo "::warning::No GCP access token — REST path unavailable"; return 10; }
+            local base="https://firebaseapphosting.googleapis.com/v1"
+            # rollouts/builds reject the locations/- wildcard; resolve the backend region via the
+            # aggregated backends list (which DOES accept it), defaulting to us-central1.
+            local loc
+            loc=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" \
+              "${base}/projects/${FIREBASE_PROJECT_ID}/locations/-/backends" 2>/dev/null \
+              | jq -r --arg B "$BACKEND" '.backends[]? | select((.name|split("/")|last)==$B) | .name|split("/")[3]' 2>/dev/null | head -1)
+            loc="${loc:-us-central1}"
+            local parent="projects/${FIREBASE_PROJECT_ID}/locations/${loc}/backends/${BACKEND}"
+            local api="${base}/${parent}"
+            local build_id="gha-${RUN_ID}-${RUN_ATTEMPT}"
+            local build_name="${parent}/builds/${build_id}"
+            echo "REST deploy → parent=$parent build=$build_id commit=$COMMIT_SHA"
+            # 1) create the build from the exact commit (buildId is REQUIRED; requestId gives retry-idempotency)
+            local bhttp
+            bhttp=$(curl -sS --max-time 90 -o /tmp/fah_build.json -w '%{http_code}' \
+              -X POST "${api}/builds?buildId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
+              -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"source\":{\"codebase\":{\"commit\":\"${COMMIT_SHA}\"}}}")
+            if [ "$bhttp" != "200" ] && [ "$bhttp" != "201" ]; then
+              if grep -qiE 'already exists' /tmp/fah_build.json; then
+                echo "Build ${build_id} already exists (idempotent retry) — reusing."
+              else
+                echo "::warning::builds.create HTTP $bhttp:"; cat /tmp/fah_build.json; return 10
+              fi
+            fi
+            # 2) create the rollout referencing that build (it waits for the build to be READY)
+            local rhttp
+            rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
+              -X POST "${api}/rollouts?requestId=$(cat /proc/sys/kernel/random/uuid)" \
+              -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"build\":\"${build_name}\"}")
+            if [ "$rhttp" != "200" ] && [ "$rhttp" != "201" ]; then
+              echo "::warning::rollouts.create HTTP $rhttp:"; cat /tmp/fah_roll.json; return 10
+            fi
+            echo "Rollout created for build ${build_id}; polling to terminal state…"
+            # 3) block until terminal so the deploy JOB reflects the real outcome (the CLI blocked; the
+            #    prod gates/record-release depend on this job's result). Match OUR rollout by its build
+            #    ref. A genuine FAILED/CANCELLED => exit non-zero (NOT a REST-call failure → NO CLI
+            #    fallback; a rebuild would just re-fail). Timeout => pass through (notify.yml reports the
+            #    final state); atlas FAH builds run ~6-7 min, budget 25 min under the 30-min job cap.
+            local start elapsed state
+            start=$(date +%s)
+            while true; do
+              elapsed=$(( $(date +%s) - start ))
+              if [ "$elapsed" -ge 1500 ]; then
+                echo "::warning::Rollout still running after ${elapsed}s — not blocking (notify.yml reports final state)"; return 0
+              fi
+              state=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" "${api}/rollouts?pageSize=10" 2>/dev/null \
+                | jq -r --arg B "$build_name" '.rollouts[]? | select(.build==$B) | .state' 2>/dev/null | head -1)
+              state="${state:-PENDING}"
+              case "$state" in
+                STATE_SUCCESS|SUCCESS|SUCCEEDED) echo "✓ Rollout SUCCEEDED in ${elapsed}s"; return 0 ;;
+                STATE_FAILED|FAILED|STATE_CANCELLED|CANCELLED) echo "::error::Rollout $state after ${elapsed}s"; return 1 ;;
+                *) echo "  state=$state elapsed=${elapsed}s — waiting"; sleep 20 ;;
+              esac
+            done
+          }
+
+          run_rest_deploy
+          rc=$?
+          if [ "$rc" -eq 1 ]; then
+            exit 1   # genuine rollout failure — do NOT fall back (a rebuild re-fails)
+          fi
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+
+          # ── FALLBACK: firebase CLI (only reached when the REST *call* could not start; rc=10) ──────
+          echo "::warning::REST rollout path unavailable (rc=$rc) — falling back to firebase-tools CLI"
+          npm install -g firebase-tools@15.22.2
+          # Transient-deploy retry (max 6, linear backoff): retry ONLY the known-transient
+          # "Failed to authenticate" blip and the build-id 409 collision; all else fails immediately.
           attempt=1
           while true; do
             fb_log=$(mktemp)
@@ -212,20 +290,86 @@ jobs:
       - name: Deploy via App Hosting (branch preview)
         id: deploy_apphosting_branch
         if: inputs.deploy_command == 'apphosting' && inputs.git_branch != '' && inputs.git_branch != 'main'
+        env:
+          FIREBASE_PROJECT_ID: ${{ inputs.firebase_project_id }}
+          APP_HOSTING_BACKEND: ${{ inputs.app_hosting_backend }}
+          GIT_BRANCH: ${{ inputs.git_branch }}
+          GCP_TOKEN: ${{ steps.auth.outputs.access_token }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
-          BACKEND="${{ inputs.app_hosting_backend }}"
-          [ -z "$BACKEND" ] && BACKEND="${{ inputs.firebase_project_id }}"
-          echo "Rolling out branch '${{ inputs.git_branch }}' to backend $BACKEND in project ${{ inputs.firebase_project_id }}"
-          # Transient-deploy retry (see "main branch" step for full rationale): retry the
-          # "Failed to authenticate" blip AND the build-id 409 collision; all other errors
-          # fail immediately as before.
+          BACKEND="$APP_HOSTING_BACKEND"
+          [ -z "$BACKEND" ] && BACKEND="$FIREBASE_PROJECT_ID"
+          echo "Rolling out branch '$GIT_BRANCH' to backend $BACKEND in project $FIREBASE_PROJECT_ID"
+          # PRIMARY: direct REST (build-from-branch then rollout). A branch preview deploys the LATEST
+          # commit on an arbitrary branch (github.sha may be a different ref for a manual dispatch), so
+          # this path uses codebase.branch — the exact semantics of the CLI's --git-branch.
+          run_rest_deploy() {
+            [ -z "$GCP_TOKEN" ] && { echo "::warning::No GCP access token — REST path unavailable"; return 10; }
+            local base="https://firebaseapphosting.googleapis.com/v1"
+            local loc
+            loc=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" \
+              "${base}/projects/${FIREBASE_PROJECT_ID}/locations/-/backends" 2>/dev/null \
+              | jq -r --arg B "$BACKEND" '.backends[]? | select((.name|split("/")|last)==$B) | .name|split("/")[3]' 2>/dev/null | head -1)
+            loc="${loc:-us-central1}"
+            local parent="projects/${FIREBASE_PROJECT_ID}/locations/${loc}/backends/${BACKEND}"
+            local api="${base}/${parent}"
+            local build_id="gha-${RUN_ID}-${RUN_ATTEMPT}"
+            local build_name="${parent}/builds/${build_id}"
+            local bhttp
+            bhttp=$(curl -sS --max-time 90 -o /tmp/fah_build.json -w '%{http_code}' \
+              -X POST "${api}/builds?buildId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
+              -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"source\":{\"codebase\":{\"branch\":\"${GIT_BRANCH}\"}}}")
+            if [ "$bhttp" != "200" ] && [ "$bhttp" != "201" ]; then
+              if grep -qiE 'already exists' /tmp/fah_build.json; then
+                echo "Build ${build_id} already exists (idempotent retry) — reusing."
+              else
+                echo "::warning::builds.create HTTP $bhttp:"; cat /tmp/fah_build.json; return 10
+              fi
+            fi
+            local rhttp
+            rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
+              -X POST "${api}/rollouts?requestId=$(cat /proc/sys/kernel/random/uuid)" \
+              -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
+              -d "{\"build\":\"${build_name}\"}")
+            if [ "$rhttp" != "200" ] && [ "$rhttp" != "201" ]; then
+              echo "::warning::rollouts.create HTTP $rhttp:"; cat /tmp/fah_roll.json; return 10
+            fi
+            echo "Rollout created for build ${build_id}; polling to terminal state…"
+            local start elapsed state
+            start=$(date +%s)
+            while true; do
+              elapsed=$(( $(date +%s) - start ))
+              if [ "$elapsed" -ge 1500 ]; then
+                echo "::warning::Rollout still running after ${elapsed}s — not blocking"; return 0
+              fi
+              state=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" "${api}/rollouts?pageSize=10" 2>/dev/null \
+                | jq -r --arg B "$build_name" '.rollouts[]? | select(.build==$B) | .state' 2>/dev/null | head -1)
+              state="${state:-PENDING}"
+              case "$state" in
+                STATE_SUCCESS|SUCCESS|SUCCEEDED) echo "✓ Rollout SUCCEEDED in ${elapsed}s"; return 0 ;;
+                STATE_FAILED|FAILED|STATE_CANCELLED|CANCELLED) echo "::error::Rollout $state after ${elapsed}s"; return 1 ;;
+                *) echo "  state=$state elapsed=${elapsed}s — waiting"; sleep 20 ;;
+              esac
+            done
+          }
+
+          run_rest_deploy
+          rc=$?
+          [ "$rc" -eq 1 ] && exit 1
+          [ "$rc" -eq 0 ] && exit 0
+
+          # FALLBACK: firebase CLI (only when the REST call could not start; rc=10).
+          echo "::warning::REST rollout path unavailable (rc=$rc) — falling back to firebase-tools CLI"
+          npm install -g firebase-tools@15.22.2
           attempt=1
           while true; do
             fb_log=$(mktemp)
             set +e
             firebase apphosting:rollouts:create "$BACKEND" \
-              --git-branch "${{ inputs.git_branch }}" \
-              --project ${{ inputs.firebase_project_id }} \
+              --git-branch "$GIT_BRANCH" \
+              --project "$FIREBASE_PROJECT_ID" \
               --non-interactive 2>&1 | tee "$fb_log"
             fb_status=${PIPESTATUS[0]}
             set -e
@@ -240,8 +384,10 @@ jobs:
       - name: Deploy via Hosting + Functions
         if: inputs.deploy_command == 'hosting-functions'
         run: |
-          # Transient-auth retry (see "main branch" step for rationale): retry only the
-          # "Failed to authenticate" blip; all other errors fail immediately as before.
+          # firebase-tools is installed inline here (the unconditional global install was removed — the
+          # apphosting path no longer needs it). Node + deps came from the hosting-functions-only setup
+          # steps above. Transient-auth retry: retry only the "Failed to authenticate" blip.
+          npm install -g firebase-tools@15.22.2
           attempt=1
           while true; do
             fb_log=$(mktemp)
