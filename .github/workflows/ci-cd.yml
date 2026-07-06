@@ -110,6 +110,16 @@ on:
           cleanly where the artifact or the ingest secret is absent.
         type: boolean
         default: true
+      test_command:
+        description: >
+          Repo-provided blocking vitest command forwarded to quality-gate (folds guard suites into the
+          single gate runner). Empty => the gate's default unit lane.
+        type: string
+        default: ''
+      tests_on_push:
+        description: 'Forwarded to quality-gate: run tests on push events too (default false — PRs are the tested path).'
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-cd-${{ github.event_name }}-${{ github.ref }}
@@ -150,6 +160,8 @@ jobs:
       run_qa_tests: ${{ inputs.run_qa_tests && github.event_name == 'push' }}
       run_pentest: ${{ inputs.run_pentest && github.event_name == 'push' }}
       run_security_scans: ${{ !(github.ref == 'refs/heads/main' || github.base_ref == 'main') }}
+      test_command: ${{ inputs.test_command }}
+      tests_on_push: ${{ inputs.tests_on_push }}
     secrets: inherit
 
   # --- report-tests: control-plane test telemetry from THIS run's vitest-report artifact ---------
