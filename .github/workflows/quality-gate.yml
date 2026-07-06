@@ -45,6 +45,23 @@ on:
         type: boolean
         default: false
         description: 'CONF-01..05 assertions. false => ::warning:: only (warn-first); true => ::error:: + fail. DO NOT flip in this phase.'
+      test_command:
+        type: string
+        default: ''
+        description: >
+          When non-empty, run this vitest command as a BLOCKING step in the gate job (its exit code
+          gates the job — same posture as a standalone guard workflow). The runner appends
+          `--reporter=default --reporter=json --outputFile=vitest-report.json` so the machine report is
+          produced in-line and uploaded as the `vitest-report` artifact (consumed by the report-tests
+          telemetry job — NO second suite run). Single-quote any glob containing shell metachars, e.g.
+          `(app)`. Empty => no test step (build-only gate, unchanged).
+      tests_on_push:
+        type: boolean
+        default: false
+        description: >
+          When false (default), the `test_command` step is SKIPPED on `push` events. Branch protection
+          makes PRs the ONLY path to dev/main, so every tree was already tested at PR time; a squash
+          merge produces an identical tree. Set true to also run tests on push (belt-and-suspenders).
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -54,8 +71,60 @@ permissions:
   contents: read
 
 jobs:
+  # --------------------------------------------------------- docs-only fast-path (cost cut)
+  # One cheap detection job whose `docs_only` output the gate/scans/conformance jobs read at STEP
+  # level. When every changed path is docs (.planning/**, docs/**, **/*.md) the heavy STEPS skip but
+  # the JOBS still SUCCEED — so the required-check contexts (Build, Test, Audit / scans / conformance)
+  # stay GREEN and a docs PR/merge doesn't spend a build+test+scan runner. FAIL-OPEN: any detection
+  # error => docs_only=false => the full gate runs (never skip on uncertainty).
+  detect-changes:
+    name: detect-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+    steps:
+      - name: Detect docs-only change
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set +e
+          FILES=""
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_NUMBER" ]; then
+            FILES=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' 2>/dev/null)
+          elif [ "$EVENT" = "push" ] && [ -n "$BASE_SHA" ] && ! echo "$BASE_SHA" | grep -qE '^0+$'; then
+            FILES=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" --jq '.files[].filename' 2>/dev/null)
+          fi
+          if [ -z "$FILES" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Changed-file set empty or undeterminable — running the full gate."
+            exit 0
+          fi
+          echo "Changed files:"; echo "$FILES"
+          # A file is "docs" if it is under .planning/ or docs/, or ends in .md (any depth). NONDOC =
+          # the files that are NOT docs; empty NONDOC => the whole change is docs-only.
+          NONDOC=$(echo "$FILES" | grep -vE '^\.planning/|^docs/|\.md$')
+          if [ -z "$NONDOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=docs-only change::All changed paths are docs (.planning/**, docs/**, **/*.md) — build/test/audit/scans/conformance skipped (job stays green)."
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Non-doc paths present — running the full gate."
+          fi
+          exit 0
+
   gate:
     name: Build, Test, Audit
+    needs: detect-changes
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -95,6 +164,7 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
+        if: needs.detect-changes.outputs.docs_only != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # --include=optional forces platform-specific optional native deps to install.
@@ -108,7 +178,7 @@ jobs:
           fi
 
       - name: Build application
-        if: inputs.needs_build
+        if: inputs.needs_build && needs.detect-changes.outputs.docs_only != 'true'
         env:
           BUILD_CMD: ${{ inputs.build_command }}
           # Raise Node's heap ceiling for next-build on hosted runners (7GB RAM). Atlas hit
@@ -119,7 +189,7 @@ jobs:
         run: bash -c "$BUILD_CMD"
 
       - name: Start server
-        if: inputs.needs_server
+        if: inputs.needs_server && needs.detect-changes.outputs.docs_only != 'true'
         run: |
           PORT=${{ inputs.server_port }} npm start &
           echo "SERVER_PID=$!" >> $GITHUB_ENV
@@ -135,7 +205,7 @@ jobs:
           exit 1
 
       - name: Generate test auth token
-        if: inputs.needs_server
+        if: inputs.needs_server && needs.detect-changes.outputs.docs_only != 'true'
         id: token
         run: |
           if [ -f scripts/generate-test-token.js ]; then
@@ -147,27 +217,53 @@ jobs:
           fi
 
       - name: Run QA test suite
-        if: inputs.run_qa_tests
+        if: inputs.run_qa_tests && needs.detect-changes.outputs.docs_only != 'true'
         env:
           TEST_SESSION_TOKEN: ${{ steps.token.outputs.TEST_SESSION_TOKEN }}
           API_BASE_URL: http://localhost:${{ inputs.server_port }}
         run: node ${{ inputs.qa_runner_path }} 2>&1
 
       - name: Run penetration test suite
-        if: inputs.run_pentest
+        if: inputs.run_pentest && needs.detect-changes.outputs.docs_only != 'true'
         env:
           TEST_SESSION_TOKEN: ${{ steps.token.outputs.TEST_SESSION_TOKEN }}
           API_BASE_URL: http://localhost:${{ inputs.server_port }}
         run: node ${{ inputs.pentest_runner_path }} 2>&1
 
       - name: Run master test runner
-        if: inputs.run_qa_tests
+        if: inputs.run_qa_tests && needs.detect-changes.outputs.docs_only != 'true'
         env:
           TEST_SESSION_TOKEN: ${{ steps.token.outputs.TEST_SESSION_TOKEN }}
           API_BASE_URL: http://localhost:${{ inputs.server_port }}
         run: node ${{ inputs.master_runner_path }} 2>&1
 
+      # --- folded test suites (cost cut): the guard suites that used to be standalone per-repo
+      #     workflows now run HERE, inside the single gate runner. BLOCKING (vitest exit code gates
+      #     the job). Skipped on push (tests_on_push=false) — branch protection means the tree was
+      #     tested at PR time — and on docs-only. Dual reporter emits vitest-report.json for the
+      #     report-tests telemetry job (no second suite run).
+      - name: Run tests (vitest, folded suites)
+        id: vitest
+        if: >-
+          inputs.test_command != '' &&
+          needs.detect-changes.outputs.docs_only != 'true' &&
+          (github.event_name != 'push' || inputs.tests_on_push)
+        env:
+          TEST_COMMAND: ${{ inputs.test_command }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash -c "$TEST_COMMAND --reporter=default --reporter=json --outputFile=vitest-report.json"
+
+      - name: Upload vitest report
+        if: always() && steps.vitest.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-report
+          path: vitest-report.json
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: npm security audit
+        if: needs.detect-changes.outputs.docs_only != 'true'
         run: npm audit --audit-level=critical
 
       - name: Stop server
@@ -203,6 +299,7 @@ jobs:
   #     dev path — skipped on main pushes and dev->main PRs, identical to before).
   scans:
     name: scans
+    needs: detect-changes
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -260,18 +357,18 @@ jobs:
 
       # ---- semgrep (ADVISORY; pip-installed — no Docker Hub dependency) ----
       - name: Set up Python for semgrep
-        if: inputs.run_security_scans
+        if: inputs.run_security_scans && needs.detect-changes.outputs.docs_only != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Cache pip downloads (semgrep wheels)
-        if: inputs.run_security_scans
+        if: inputs.run_security_scans && needs.detect-changes.outputs.docs_only != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-semgrep-${{ runner.os }}-py312
       - name: Semgrep diff scan (PR) / full scan (push)
-        if: inputs.run_security_scans
+        if: inputs.run_security_scans && needs.detect-changes.outputs.docs_only != 'true'
         # ADVISORY: continue-on-error keeps the job green; findings surface as a warning + summary.
         continue-on-error: true
         # SECURITY: github.base_ref via env: + quoted shell var, not direct ${{ }} interpolation
@@ -317,7 +414,7 @@ jobs:
 
       # ---- osv-scanner (ADVISORY) ----
       - name: Run OSV-Scanner
-        if: inputs.run_security_scans
+        if: inputs.run_security_scans && needs.detect-changes.outputs.docs_only != 'true'
         # google/osv-scanner-action is a monorepo; sub-action lives in /osv-scanner-action.
         uses: google/osv-scanner-action/osv-scanner-action@v2.3.5   # TODO: pin to commit SHA
         with:
@@ -328,7 +425,7 @@ jobs:
             ./
         continue-on-error: true   # known vulns surface but don't block; Dependabot is the remediation channel
       - name: Summarize OSV findings
-        if: always() && inputs.run_security_scans
+        if: always() && inputs.run_security_scans && needs.detect-changes.outputs.docs_only != 'true'
         run: |
           if [[ -f osv.json ]]; then
             count=$(jq '[.results[]?.packages[]?.vulnerabilities[]?] | length' osv.json 2>/dev/null || echo 0)
@@ -338,14 +435,14 @@ jobs:
 
       # ---- gitleaks (ADVISORY; binary, Action requires a paid org license) ----
       - name: Install gitleaks
-        if: inputs.run_security_scans
+        if: inputs.run_security_scans && needs.detect-changes.outputs.docs_only != 'true'
         run: |
           GITLEAKS_VERSION="8.30.1"
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp
           sudo mv /tmp/gitleaks /usr/local/bin/
       - name: Run gitleaks (PR diff or full repo scan, advisory)
-        if: inputs.run_security_scans
+        if: inputs.run_security_scans && needs.detect-changes.outputs.docs_only != 'true'
         continue-on-error: true
         # SECURITY: github.base_ref + event_name via env: + quoted shell vars (avoids run-shell-injection).
         env:
@@ -387,6 +484,7 @@ jobs:
   # after an observation window — do NOT set conformance_enforce=true from any ci-cd.yml yet.
   conformance:
     name: conformance
+    needs: detect-changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -396,6 +494,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Checkout shared-workflows checker
+        if: needs.detect-changes.outputs.docs_only != 'true'
         uses: actions/checkout@v4
         with:
           repository: triarchsecurity/shared-workflows
@@ -403,14 +502,18 @@ jobs:
           path: _conformance
 
       - name: Set up Node.js
+        if: needs.detect-changes.outputs.docs_only != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: 'npm'
 
       - name: Install checker deps
+        if: needs.detect-changes.outputs.docs_only != 'true'
         run: cd _conformance/.github/conformance && npm ci
 
       - name: CI/infra conformance assertions (warn-first)
+        if: needs.detect-changes.outputs.docs_only != 'true'
         env:
           ENFORCE: ${{ inputs.conformance_enforce }}
         run: node _conformance/.github/conformance/check-all.mjs --target "$GITHUB_WORKSPACE"

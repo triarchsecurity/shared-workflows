@@ -51,6 +51,16 @@ on:
         type: string
         default: 'https://crm.triarchsecurity.com'
         description: 'Receiver base URL. vars.PORTFOLIO_INGEST_URL on the caller wins if set.'
+      report_artifact:
+        type: string
+        default: ''
+        description: >
+          ARTIFACT MODE (cost cut). When non-empty, DO NOT check out node / run the suite — instead
+          download the same-run artifact of this name (the `vitest-report` the gate already produced)
+          and POST the derived payload. Eliminates the standalone suite RE-RUN (~7.5 min/push). The
+          checkout still happens (cheap) so the tsconfig quarantine + ledger owned-red counts are still
+          derived. If the artifact is absent (docs-only PR, no test_command) the job SKIPS cleanly — it
+          never re-runs the suite and never posts a spurious zero row. Empty => legacy self-run mode.
       node_version:
         type: string
         default: '22'
@@ -88,24 +98,37 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # ---- SELF-RUN MODE (report_artifact == '') : check out node + run the suite ----
       - uses: actions/setup-node@v4
-        if: steps.preflight.outputs.configured == 'true'
+        if: steps.preflight.outputs.configured == 'true' && inputs.report_artifact == ''
         with:
           node-version: ${{ inputs.node_version }}
           cache: 'npm'
 
       - name: Install deps
-        if: steps.preflight.outputs.configured == 'true'
+        if: steps.preflight.outputs.configured == 'true' && inputs.report_artifact == ''
         run: npm ci
         env:
           NODE_AUTH_TOKEN: ${{ secrets.PACKAGES_REGISTRY_TOKEN }}
 
       - name: Run the test lane (JSON reporter)
-        if: steps.preflight.outputs.configured == 'true'
+        if: steps.preflight.outputs.configured == 'true' && inputs.report_artifact == ''
         # `|| true` — a test FAILURE must still POST its results (RED is the truth we report), never abort.
         env:
           TEST_COMMAND: ${{ inputs.test_command }}
         run: bash -c "$TEST_COMMAND" || true
+
+      # ---- ARTIFACT MODE (report_artifact != '') : reuse the report the gate already produced ----
+      # No node, no npm ci, no suite run. continue-on-error so an ABSENT artifact (docs-only PR, or a
+      # repo that sets no test_command) does not fail the job — the POST step below then skips cleanly.
+      - name: Download test report artifact
+        id: dl
+        if: steps.preflight.outputs.configured == 'true' && inputs.report_artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.report_artifact }}
+          path: .
 
       - name: Build + POST the machine-derived test-run payload
         if: steps.preflight.outputs.configured == 'true'
@@ -114,13 +137,21 @@ jobs:
           INGEST_SECRET: ${{ secrets.PORTFOLIO_ROLLUP_INGEST_SECRET }}
           RUN_ID: ${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
-          BRANCH: ${{ github.ref_name }}
+          # On a pull_request the ref_name is "<n>/merge"; head_ref (the feature branch) is the useful label.
+          BRANCH: ${{ github.head_ref || github.ref_name }}
           REPO: ${{ github.repository }}
           REPORT_PATH: ${{ inputs.report_path }}
           TSCONFIG_TEST_PATH: ${{ inputs.tsconfig_test_path }}
           LEDGER_PATH: ${{ inputs.ledger_path }}
+          ARTIFACT_MODE: ${{ inputs.report_artifact }}
         run: |
           set -euo pipefail
+          # ARTIFACT MODE + no report on disk => the gate skipped tests (docs-only PR, or no test_command).
+          # SKIP cleanly — never re-run the suite, never POST a spurious all-zero row.
+          if [ -n "$ARTIFACT_MODE" ] && [ ! -f "$REPORT_PATH" ]; then
+            echo "::notice title=Test telemetry skipped::artifact '$ARTIFACT_MODE' not present this run (tests skipped at the gate — docs-only or no test_command). Not posting; tests run at PR time only."
+            exit 0
+          fi
           # MACHINE-DERIVED payload — NEVER hand-curated. Parse the test JSON for totals + per-file
           # failures, the tsconfig.test.json `exclude` allowlist for the quarantine count, and the
           # ledger's enumerated owned-red rows. Every source honest-degrades if absent (portability).
