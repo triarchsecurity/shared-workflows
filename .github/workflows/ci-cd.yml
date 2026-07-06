@@ -102,24 +102,6 @@ on:
         description: 'Optional READ-ONLY DB drift check (e.g. "npm run db:check"). Empty => skipped. When set, it gates deploy. Must be read-only — never a migration (prod DATABASE_URL hazard).'
         type: string
         default: ''
-      report_tests:
-        description: >
-          Emit test-run telemetry to the control plane from the vitest-report artifact quality-gate
-          produced THIS run (no second suite run). Fires on pull_request only (where the gate runs
-          tests); on push the gate skips tests so there is nothing to report — honest by design. No-ops
-          cleanly where the artifact or the ingest secret is absent.
-        type: boolean
-        default: true
-      test_command:
-        description: >
-          Repo-provided blocking vitest command forwarded to quality-gate (folds guard suites into the
-          single gate runner). Empty => the gate's default unit lane.
-        type: string
-        default: ''
-      tests_on_push:
-        description: 'Forwarded to quality-gate: run tests on push events too (default false — PRs are the tested path).'
-        type: boolean
-        default: false
 
 concurrency:
   group: ci-cd-${{ github.event_name }}-${{ github.ref }}
@@ -160,24 +142,6 @@ jobs:
       run_qa_tests: ${{ inputs.run_qa_tests && github.event_name == 'push' }}
       run_pentest: ${{ inputs.run_pentest && github.event_name == 'push' }}
       run_security_scans: ${{ !(github.ref == 'refs/heads/main' || github.base_ref == 'main') }}
-      test_command: ${{ inputs.test_command }}
-      tests_on_push: ${{ inputs.tests_on_push }}
-    secrets: inherit
-
-  # --- report-tests: control-plane test telemetry from THIS run's vitest-report artifact ---------
-  # Replaces the standalone per-repo test-telemetry workflow that RE-RAN the whole suite on every dev
-  # push (~7.5 billed min/push). The gate already ran vitest at PR time and uploaded `vitest-report`;
-  # this job just downloads that artifact and POSTs the derived payload — NO second suite run.
-  # PR-only: on push the gate skips tests (tests_on_push=false), so there is no artifact to report.
-  # always() so a RED gate still reports its results (RED is the truth). No-ops cleanly (::notice::)
-  # when the artifact is absent (docs-only PR, or a repo that sets no test_command) or the ingest
-  # secret is unset — safe to leave on for every consumer repo.
-  report-tests:
-    needs: [quality-gate]
-    if: always() && inputs.report_tests && github.event_name == 'pull_request'
-    uses: triarchsecurity/shared-workflows/.github/workflows/test-telemetry.yml@release/v9
-    with:
-      report_artifact: vitest-report
     secrets: inherit
 
   # --- env-select: branch -> environment + backend (internalized) ---------------
