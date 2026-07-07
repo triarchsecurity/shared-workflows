@@ -236,14 +236,20 @@ jobs:
                 echo "::warning::builds.create HTTP $bhttp:"; cat /tmp/fah_build.json; return 10
               fi
             fi
-            # 2) create the rollout referencing that build (it waits for the build to be READY)
+            # 2) create the rollout referencing that build (it waits for the build to be READY).
+            #    rolloutId is REQUIRED (HTTP 400 "must provide a rollout id" — atlas run 28835924838);
+            #    reuse the gha build id, unique per run attempt. 'already exists' => idempotent retry.
             local rhttp
             rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
-              -X POST "${api}/rollouts?requestId=$(cat /proc/sys/kernel/random/uuid)" \
+              -X POST "${api}/rollouts?rolloutId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
               -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
               -d "{\"build\":\"${build_name}\"}")
             if [ "$rhttp" != "200" ] && [ "$rhttp" != "201" ]; then
-              echo "::warning::rollouts.create HTTP $rhttp:"; cat /tmp/fah_roll.json; return 10
+              if grep -qiE 'already exists' /tmp/fah_roll.json; then
+                echo "Rollout ${build_id} already exists (idempotent retry) — polling it."
+              else
+                echo "::warning::rollouts.create HTTP $rhttp:"; cat /tmp/fah_roll.json; return 10
+              fi
             fi
             echo "Rollout created for build ${build_id}; polling to terminal state…"
             # 3) block until terminal so the deploy JOB reflects the real outcome (the CLI blocked; the
@@ -269,8 +275,11 @@ jobs:
             done
           }
 
-          run_rest_deploy
-          rc=$?
+          # `|| rc=$?` keeps the default `bash -e` from killing the script on a nonzero return —
+          # a bare call exited the step with rc=10 and made the CLI fallback DEAD CODE (atlas run
+          # 28835924838: "Process completed with exit code 10", no fallback attempted).
+          rc=0
+          run_rest_deploy || rc=$?
           if [ "$rc" -eq 1 ]; then
             exit 1   # genuine rollout failure — do NOT fall back (a rebuild re-fails)
           fi
@@ -342,13 +351,18 @@ jobs:
                 echo "::warning::builds.create HTTP $bhttp:"; cat /tmp/fah_build.json; return 10
               fi
             fi
+            # rolloutId is REQUIRED (HTTP 400 otherwise); 'already exists' => idempotent retry.
             local rhttp
             rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
-              -X POST "${api}/rollouts?requestId=$(cat /proc/sys/kernel/random/uuid)" \
+              -X POST "${api}/rollouts?rolloutId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
               -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
               -d "{\"build\":\"${build_name}\"}")
             if [ "$rhttp" != "200" ] && [ "$rhttp" != "201" ]; then
-              echo "::warning::rollouts.create HTTP $rhttp:"; cat /tmp/fah_roll.json; return 10
+              if grep -qiE 'already exists' /tmp/fah_roll.json; then
+                echo "Rollout ${build_id} already exists (idempotent retry) — polling it."
+              else
+                echo "::warning::rollouts.create HTTP $rhttp:"; cat /tmp/fah_roll.json; return 10
+              fi
             fi
             echo "Rollout created for build ${build_id}; polling to terminal state…"
             local start elapsed state
@@ -369,8 +383,9 @@ jobs:
             done
           }
 
-          run_rest_deploy
-          rc=$?
+          # `|| rc=$?` keeps `bash -e` from killing the script on a nonzero return (see main-branch step).
+          rc=0
+          run_rest_deploy || rc=$?
           [ "$rc" -eq 1 ] && exit 1
           [ "$rc" -eq 0 ] && exit 0
 
