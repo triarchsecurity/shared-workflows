@@ -114,16 +114,30 @@ jobs:
           echo "APP_VERSION=$VER" >> $GITHUB_OUTPUT
           echo "Extracted version: $VER"
 
-      # Auth mints an access_token (token_format) for the REST rollout path AND still writes the ADC
-      # credentials file (create_credentials_file defaults true) so the firebase-tools CLI FALLBACK
-      # keeps working. setup-gcloud is GONE — the REST path uses curl, and firebase-tools carries its
-      # own auth; neither needs the gcloud CLI (~20s saved per deploy of every repo).
+      # Auth writes the ADC credentials file (create_credentials_file defaults true) so the
+      # firebase-tools CLI FALLBACK keeps working. NO token_format here: with a plain SA key,
+      # `token_format: access_token` makes auth@v2 call iamcredentials.generateAccessToken on the SA
+      # itself, which requires roles/iam.serviceAccountTokenCreator on itself — no consumer project
+      # grants that, so the first real deploy on the overhaul 403'd (atlas run 28835715771,
+      # 2026-07-06). The REST token is minted below via the RUNNER-PREINSTALLED gcloud instead (no
+      # setup-gcloud install — ~3s, no extra IAM). setup-gcloud stays GONE.
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.FIREBASE_SA_KEY }}
-          token_format: 'access_token'
+
+      - name: Mint GCP access token (preinstalled gcloud; no IAM tokenCreator needed)
+        id: gcp_token
+        if: inputs.deploy_command == 'apphosting'
+        env:
+          CREDS_FILE: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          gcloud auth activate-service-account --key-file="$CREDS_FILE" --quiet
+          TOKEN=$(gcloud auth print-access-token)
+          if [ -z "$TOKEN" ]; then echo "::error::Failed to mint GCP access token"; exit 1; fi
+          echo "::add-mask::$TOKEN"
+          echo "access_token=$TOKEN" >> "$GITHUB_OUTPUT"
 
       # Node + project deps are needed ONLY by the hosting-functions deploy path (firebase deploy runs
       # the repo's predeploy build). The apphosting path builds SERVER-SIDE from the git commit and
@@ -153,7 +167,7 @@ jobs:
           APP_HOSTING_BACKEND: ${{ inputs.app_hosting_backend }}
           DEV_BACKEND: ${{ inputs.dev_backend }}
           INPUT_GIT_BRANCH: ${{ inputs.git_branch }}
-          GCP_TOKEN: ${{ steps.auth.outputs.access_token }}
+          GCP_TOKEN: ${{ steps.gcp_token.outputs.access_token }}
           COMMIT_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -294,7 +308,7 @@ jobs:
           FIREBASE_PROJECT_ID: ${{ inputs.firebase_project_id }}
           APP_HOSTING_BACKEND: ${{ inputs.app_hosting_backend }}
           GIT_BRANCH: ${{ inputs.git_branch }}
-          GCP_TOKEN: ${{ steps.auth.outputs.access_token }}
+          GCP_TOKEN: ${{ steps.gcp_token.outputs.access_token }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
