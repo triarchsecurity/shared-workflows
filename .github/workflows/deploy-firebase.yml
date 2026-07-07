@@ -523,7 +523,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" || echo "000")
 
-          if [ "$HTTP_CODE" = "201" ]; then
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
             echo "Admin ${ENVIRONMENT} callback succeeded (HTTP 201). release_logs row created for ${BRANCH} v${{ steps.version.outputs.APP_VERSION }}."
           else
             RESP_TEXT=$(head -c 500 "$RESP_BODY")
