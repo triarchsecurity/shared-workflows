@@ -283,8 +283,12 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      # DEV lane (asymmetric_lanes): audit skipped — the bare-bones dev signal is build-only; the
+      # audit runs on the PROD lane. Default false => runs on every non-docs event, exactly as before.
       - name: npm security audit
-        if: needs.detect-changes.outputs.docs_only != 'true'
+        if: >-
+          needs.detect-changes.outputs.docs_only != 'true' &&
+          !(inputs.asymmetric_lanes && (github.base_ref == 'dev' || github.ref == 'refs/heads/dev'))
         run: npm audit --audit-level=critical
 
       - name: Stop server
