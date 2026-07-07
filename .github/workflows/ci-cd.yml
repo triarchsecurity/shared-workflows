@@ -229,9 +229,12 @@ jobs:
           fi
 
   # --- version: extract package.json version ONCE (internalized) ----------------
+  # DEV-lane push (asymmetric): skipped — deploy-firebase extracts the version itself and exposes it
+  # as the deploy job's output; notify falls back to that. deploy-dev's `always() && …` if does not
+  # check this job's result, so skipping it does not block the deploy. Default false => unchanged.
   version:
     needs: quality-gate
-    if: inputs.deploy_in_workflow && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
+    if: inputs.deploy_in_workflow && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && !(inputs.asymmetric_lanes && github.ref == 'refs/heads/dev')
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.extract.outputs.version }}
@@ -312,6 +315,9 @@ jobs:
       dev_backend: ${{ inputs.dev_backend }}
       app_url: ${{ inputs.dev_url }}
       environment: dev
+      # Asymmetric DEV lane: fire-and-forget — create the rollout, don't burn the runner polling the
+      # ~7-min server-side FAH build. Default (false) => true => blocking poll, unchanged.
+      wait_for_rollout: ${{ !inputs.asymmetric_lanes }}
     secrets: inherit
 
   # --- deploy: prod --------------------------------------------------------------
@@ -336,12 +342,16 @@ jobs:
     secrets: inherit
 
   # --- record-release: POST deploy to admin (CL-4 source data; internalized) ----
+  # DEV-lane push (asymmetric): skipped — deploy-firebase's in-job "Notify admin (release record)"
+  # step already POSTs the same /api/platform/ingest/release-logs endpoint, so this separate 1-min
+  # job is a duplicate on that lane. Default false => unchanged.
   record-release:
     needs: [env-select, version, deploy-dev, deploy-prod]
     if: |
       always() && inputs.record_release &&
       github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') &&
-      (needs.deploy-dev.result == 'success' || needs.deploy-prod.result == 'success')
+      (needs.deploy-dev.result == 'success' || needs.deploy-prod.result == 'success') &&
+      !(inputs.asymmetric_lanes && github.ref == 'refs/heads/dev')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -388,10 +398,14 @@ jobs:
     uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@release/v9
     with:
       status: ${{ needs.deploy-prod.result != 'skipped' && needs.deploy-prod.result || needs.deploy-dev.result }}
-      version: ${{ needs.version.outputs.version }}
+      # version job is skipped on the asymmetric DEV-lane push — fall back to the version the deploy
+      # job itself extracted. When the version job ran, the first operand wins (unchanged behavior).
+      version: ${{ needs.version.outputs.version || needs.deploy-dev.outputs.version }}
       project_name: ${{ inputs.project_name }} (${{ needs.env-select.outputs.environment }})
       app_url: ${{ needs.env-select.outputs.environment == 'prod' && inputs.prod_url || inputs.dev_url }}
       app_hosting_backend: ${{ needs.env-select.outputs.backend }}
       firebase_project_id: ${{ inputs.firebase_project_id }}
-      wait_for_fah: true
+      # Asymmetric DEV lane fired-and-forgot the rollout — do NOT move the ~7-min poll here; report
+      # the deploy job status immediately. Every other case: true, unchanged.
+      wait_for_fah: ${{ !(inputs.asymmetric_lanes && github.ref == 'refs/heads/dev') }}
     secrets: inherit

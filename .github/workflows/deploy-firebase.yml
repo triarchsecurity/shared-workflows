@@ -36,6 +36,15 @@ on:
         required: false
         type: string
         default: 'prod'
+      wait_for_rollout:
+        description: >
+          When true (default), the REST apphosting path polls the rollout to a terminal state so the
+          job result reflects the real outcome (prod gates/record-release depend on it). False =
+          fire-and-forget: create the build+rollout and return immediately — the asymmetric DEV lane
+          uses this (FAH builds server-side ~7 min; polling burned ~8 billed min/push on the runner).
+        required: false
+        type: boolean
+        default: true
     secrets:
       # required:false so the canonical ci-cd.yml can be referenced by repos that
       # never deploy through it (static/FAH-native, e.g. www). GitHub validates
@@ -171,6 +180,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          WAIT_FOR_ROLLOUT: ${{ inputs.wait_for_rollout }}
         run: |
           # v5: resolve backend with explicit dev_backend support (no more "-dev" auto-suffix
           # when the caller has supplied an explicit dev backend name).
@@ -250,6 +260,12 @@ jobs:
               else
                 echo "::warning::rollouts.create HTTP $rhttp:"; cat /tmp/fah_roll.json; return 10
               fi
+            fi
+            # fire-and-forget (wait_for_rollout=false, asymmetric DEV lane): the rollout is created and
+            # FAH builds server-side — return without burning the runner on an ~8-min poll.
+            if [ "$WAIT_FOR_ROLLOUT" != "true" ]; then
+              echo "✓ Rollout ${build_id} created (fire-and-forget — wait_for_rollout=false; FAH builds server-side)"
+              return 0
             fi
             echo "Rollout created for build ${build_id}; polling to terminal state…"
             # 3) block until terminal so the deploy JOB reflects the real outcome (the CLI blocked; the
