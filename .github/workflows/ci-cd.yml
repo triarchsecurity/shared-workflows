@@ -102,6 +102,34 @@ on:
         description: 'Optional READ-ONLY DB drift check (e.g. "npm run db:check"). Empty => skipped. When set, it gates deploy. Must be read-only — never a migration (prod DATABASE_URL hazard).'
         type: string
         default: ''
+      report_tests:
+        description: >
+          Emit test-run telemetry to the control plane from the vitest-report artifact quality-gate
+          produced THIS run (no second suite run). Fires on pull_request only (where the gate runs
+          tests); on push the gate skips tests so there is nothing to report — honest by design. No-ops
+          cleanly where the artifact or the ingest secret is absent.
+        type: boolean
+        default: true
+      test_command:
+        description: >
+          Repo-provided blocking vitest command forwarded to quality-gate (folds guard suites into the
+          single gate runner). Empty => the gate's default unit lane.
+        type: string
+        default: ''
+      tests_on_push:
+        description: 'Forwarded to quality-gate: run tests on push events too (default false — PRs are the tested path).'
+        type: boolean
+        default: false
+      asymmetric_lanes:
+        description: >
+          Opt-in: bare-bones DEV lane (minimal PR-to-dev signal, deploy-only push-to-dev) + full robust
+          gate on the PROD/customer lanes. When true the pipeline computes the lane from the event and
+          passes branch-conditional values to quality-gate: DEV lane (PR base=dev or push to dev) skips
+          QA/pentest/security-scans/folded-tests/conformance and (on push) the build — FAH builds server
+          side; PROD lane (PR base=main or push to main) runs the full robust posture unchanged. Other
+          repos leave this false => behavior is byte-for-byte identical to the plain overhaul.
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-cd-${{ github.event_name }}-${{ github.ref }}
@@ -131,17 +159,46 @@ jobs:
           fi
 
   # --- GATE: build + scans + (push-only) QA/pentest -----------------------------
-  # Security scans run on the dev path only (skip main push + PR->main).
+  # Default (asymmetric_lanes=false): security scans run on the dev path only (skip main push + PR->main).
+  # Opt-in (asymmetric_lanes=true): the expensive suites INVERT to the PROD lane so the DEV lane is
+  # bare-bones. The lane is computed inline from the event; asymmetric_lanes is ALSO forwarded so the
+  # gate can skip whole jobs (scans/conformance) on the dev lane — job count, not step count, is what
+  # GitHub bills. Every expression collapses to the original overhaul value when asymmetric_lanes=false.
   quality-gate:
-    uses: triarchsecurity/shared-workflows/.github/workflows/quality-gate.yml@release/v9
+    uses: triarchsecurity/shared-workflows/.github/workflows/quality-gate.yml@release/v9-next
     with:
       node_version: ${{ inputs.node_version }}
-      needs_build: true
+      # DEV-lane push is deploy-only (FAH builds server side) => no build; every other case builds.
+      needs_build: ${{ !(inputs.asymmetric_lanes && github.event_name == 'push' && github.ref == 'refs/heads/dev') }}
       build_command: ${{ inputs.build_command }}
       needs_server: ${{ inputs.needs_server && github.event_name == 'push' }}
-      run_qa_tests: ${{ inputs.run_qa_tests && github.event_name == 'push' }}
-      run_pentest: ${{ inputs.run_pentest && github.event_name == 'push' }}
-      run_security_scans: ${{ !(github.ref == 'refs/heads/main' || github.base_ref == 'main') }}
+      # QA/pentest: push-only always; under asymmetric_lanes, PROD-push (main) only.
+      run_qa_tests: ${{ inputs.run_qa_tests && github.event_name == 'push' && (!inputs.asymmetric_lanes || github.ref == 'refs/heads/main') }}
+      run_pentest: ${{ inputs.run_pentest && github.event_name == 'push' && (!inputs.asymmetric_lanes || github.ref == 'refs/heads/main') }}
+      # Scans: default = dev path (not main). Asymmetric = PROD lane (main) only.
+      run_security_scans: ${{ inputs.asymmetric_lanes && (github.ref == 'refs/heads/main' || github.base_ref == 'main') || (!inputs.asymmetric_lanes && !(github.ref == 'refs/heads/main' || github.base_ref == 'main')) }}
+      # Folded guard suites: run on the PROD lane (or always when not asymmetric); blanked on the DEV lane.
+      test_command: ${{ (!inputs.asymmetric_lanes || github.base_ref == 'main' || github.ref == 'refs/heads/main') && inputs.test_command || '' }}
+      tests_on_push: ${{ inputs.tests_on_push }}
+      # Forwarded so the gate can skip the scans + conformance JOBS on the DEV lane (default false = no-op).
+      asymmetric_lanes: ${{ inputs.asymmetric_lanes }}
+    secrets: inherit
+
+  # --- report-tests: control-plane test telemetry from THIS run's vitest-report artifact ---------
+  # Replaces the standalone per-repo test-telemetry workflow that RE-RAN the whole suite on every dev
+  # push (~7.5 billed min/push). The gate already ran vitest at PR time and uploaded `vitest-report`;
+  # this job just downloads that artifact and POSTs the derived payload — NO second suite run.
+  # PR-only: on push the gate skips tests (tests_on_push=false), so there is no artifact to report.
+  # always() so a RED gate still reports its results (RED is the truth). No-ops cleanly (::notice::)
+  # when the artifact is absent (docs-only PR, or a repo that sets no test_command) or the ingest
+  # secret is unset — safe to leave on for every consumer repo.
+  # DEV-lane PRs run no folded tests, so there is no vitest-report to telemetry — skip the job entirely.
+  report-tests:
+    needs: [quality-gate]
+    if: always() && inputs.report_tests && github.event_name == 'pull_request' && !(inputs.asymmetric_lanes && github.base_ref == 'dev')
+    uses: triarchsecurity/shared-workflows/.github/workflows/test-telemetry.yml@release/v9-next
+    with:
+      report_artifact: vitest-report
     secrets: inherit
 
   # --- env-select: branch -> environment + backend (internalized) ---------------
@@ -215,14 +272,14 @@ jobs:
   verify-dev-deployed:
     needs: env-select
     if: needs.env-select.outputs.environment == 'prod'
-    uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9
+    uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9-next
 
   # --- GATE: CL-4 prod-version invariants (prod only). Centralized for ALL prod
   #     entrypoints so it cannot be bypassed (fixes truthtreason F3). ------------
   cl4-gate:
     needs: [env-select, version]
     if: needs.env-select.outputs.environment == 'prod'
-    uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@release/v9
+    uses: triarchsecurity/shared-workflows/.github/workflows/gate-prod-version.yml@release/v9-next
     with:
       project_key: ${{ inputs.project_key }}
       target_version: ${{ needs.version.outputs.version }}
@@ -247,7 +304,7 @@ jobs:
       github.event_name == 'push' && github.ref == 'refs/heads/dev' &&
       needs.quality-gate.result == 'success' && needs.env-select.result == 'success' &&
       (needs.db-check.result == 'success' || needs.db-check.result == 'skipped')
-    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
+    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9-next
     with:
       firebase_project_id: ${{ inputs.firebase_project_id }}
       deploy_command: ${{ inputs.deploy_command }}
@@ -269,7 +326,7 @@ jobs:
       (needs.gate-prod.result == 'success' || needs.gate-prod.result == 'skipped') &&
       (needs.cl4-gate.result == 'success' || needs.cl4-gate.result == 'skipped') &&
       (needs.db-check.result == 'success' || needs.db-check.result == 'skipped')
-    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9
+    uses: triarchsecurity/shared-workflows/.github/workflows/deploy-firebase.yml@release/v9-next
     with:
       firebase_project_id: ${{ inputs.firebase_project_id }}
       deploy_command: ${{ inputs.deploy_command }}
@@ -328,7 +385,7 @@ jobs:
   notify:
     needs: [quality-gate, env-select, version, deploy-dev, deploy-prod]
     if: always() && inputs.deploy_in_workflow && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
-    uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@release/v9
+    uses: triarchsecurity/shared-workflows/.github/workflows/notify.yml@release/v9-next
     with:
       status: ${{ needs.deploy-prod.result != 'skipped' && needs.deploy-prod.result || needs.deploy-dev.result }}
       version: ${{ needs.version.outputs.version }}
