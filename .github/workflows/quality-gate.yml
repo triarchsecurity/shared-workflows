@@ -91,28 +91,35 @@ jobs:
     name: detect-changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
+    # NO job-level `permissions:` here — a NESTED job may only request permissions the TOP-LEVEL thin
+    # caller granted, and every consumer grants `contents: write, packages: read` only. The original
+    # #56 shipped this job requesting `pull-requests: read`, which the workflow compiler rejects for
+    # ALL 7 consumers at once — the fleet-wide invisible startup_failure (error text exists only in
+    # the Actions web UI). Detection is therefore GIT-ONLY: checkout + `git diff --name-only` against
+    # the event-payload SHAs — no PR-files API, no extra permission scope.
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
     steps:
+      - name: Checkout (full history so base/head SHAs resolve locally)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Detect docs-only change
         id: detect
         env:
-          GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.before }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_SHA: ${{ github.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
         run: |
           set +e
           FILES=""
-          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_NUMBER" ]; then
-            FILES=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename' 2>/dev/null)
-          elif [ "$EVENT" = "push" ] && [ -n "$BASE_SHA" ] && ! echo "$BASE_SHA" | grep -qE '^0+$'; then
-            FILES=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" --jq '.files[].filename' 2>/dev/null)
+          if [ "$EVENT" = "pull_request" ] && [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ]; then
+            # three-dot diff = changes on the PR head since merge-base (same set the PR files API returns)
+            FILES=$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA" 2>/dev/null)
+          elif [ "$EVENT" = "push" ] && [ -n "$PUSH_BASE_SHA" ] && ! echo "$PUSH_BASE_SHA" | grep -qE '^0+$'; then
+            FILES=$(git diff --name-only "$PUSH_BASE_SHA" "$HEAD_SHA" 2>/dev/null)
           fi
           if [ -z "$FILES" ]; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
