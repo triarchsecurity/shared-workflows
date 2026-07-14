@@ -339,6 +339,10 @@ jobs:
       app_hosting_backend: ${{ inputs.app_hosting_backend }}
       app_url: ${{ inputs.prod_url }}
       environment: prod
+      # Asymmetric PROD lane: fire-and-forget — create the rollout, don't burn the runner polling the
+      # ~25-min server-side FAH build+rollout. Default (false) => true => blocking poll, unchanged. The
+      # rollout still completes on FAH; prod-live is verified out-of-band (/api/health + cl4 pairing).
+      wait_for_rollout: ${{ !inputs.asymmetric_lanes }}
     secrets: inherit
 
   # --- record-release: POST deploy to admin (CL-4 source data; internalized) ----
@@ -405,7 +409,7 @@ jobs:
       app_url: ${{ needs.env-select.outputs.environment == 'prod' && inputs.prod_url || inputs.dev_url }}
       app_hosting_backend: ${{ needs.env-select.outputs.backend }}
       firebase_project_id: ${{ inputs.firebase_project_id }}
-      # Asymmetric DEV lane fired-and-forgot the rollout — do NOT move the ~7-min poll here; report
-      # the deploy job status immediately. Every other case: true, unchanged.
-      wait_for_fah: ${{ !(inputs.asymmetric_lanes && github.ref == 'refs/heads/dev') }}
+      # Asymmetric lane (dev OR prod) fired-and-forgot the rollout — do NOT re-poll the ~7-25-min FAH
+      # build here; report the deploy job status immediately. Non-asymmetric repos: true, unchanged.
+      wait_for_fah: ${{ !inputs.asymmetric_lanes }}
     secrets: inherit
