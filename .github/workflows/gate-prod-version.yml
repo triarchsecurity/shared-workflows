@@ -227,18 +227,55 @@ jobs:
           fi
 
           # semver_cmp A B -> echoes -1 (A<B), 0 (A==B), 1 (A>B).
-          # Compares numeric X.Y.Z only — pre-release suffixes ignored for the comparison
-          # (they're permitted in the regex but semver pre-release ordering is out of scope).
+          # Full SemVer 2.0.0 §11 precedence: X.Y.Z compared numerically; a version
+          # WITHOUT a prerelease outranks the same X.Y.Z WITH one (2.2.0 > 2.2.0-rc.38);
+          # dot-separated prerelease identifiers are compared left-to-right, numeric
+          # identifiers numerically (so rc.38 > rc.36 > rc.5), numeric ranks below
+          # non-numeric, and a longer identifier set (all prior equal) ranks higher.
+          # NOTE (fix 2026-07-15): the previous version stripped the prerelease
+          # (`${1%%-*}`) and compared X.Y.Z only, so EVERY 2.2.0-rc.N compared EQUAL —
+          # INV-3 (blocks on equal) then falsely blocked rc.36 -> rc.38 (and any same-minor
+          # rc promotion once prod held a 2.2.0-rc.* value). Prerelease ordering is in scope.
           semver_cmp() {
-            local a="${1%%-*}" b="${2%%-*}"
+            local a="$1" b="$2"
+            local a_main="${a%%-*}" b_main="${b%%-*}"
+            local a_pre="" b_pre=""
+            case "$a" in *-*) a_pre="${a#*-}";; esac
+            case "$b" in *-*) b_pre="${b#*-}";; esac
             local IFS=.
             # shellcheck disable=SC2206
-            local a_arr=($a) b_arr=($b)
+            local am=($a_main) bm=($b_main)
+            local i
             for i in 0 1 2; do
-              local ai="${a_arr[$i]:-0}"
-              local bi="${b_arr[$i]:-0}"
+              local ai="${am[$i]:-0}" bi="${bm[$i]:-0}"
               if [ "$ai" -lt "$bi" ]; then echo -1; return; fi
               if [ "$ai" -gt "$bi" ]; then echo 1; return; fi
+            done
+            # X.Y.Z equal — apply prerelease precedence.
+            if [ -z "$a_pre" ] && [ -z "$b_pre" ]; then echo 0; return; fi
+            if [ -z "$a_pre" ]; then echo 1; return; fi   # A is final, B is pre -> A higher
+            if [ -z "$b_pre" ]; then echo -1; return; fi  # A is pre, B is final -> A lower
+            # shellcheck disable=SC2206
+            local ap=($a_pre) bp=($b_pre)
+            local n=${#ap[@]}; [ "${#bp[@]}" -gt "$n" ] && n=${#bp[@]}
+            for ((i=0; i<n; i++)); do
+              local aid="${ap[$i]-}" bid="${bp[$i]-}"
+              if [ -z "$aid" ]; then echo -1; return; fi   # A ran out of identifiers -> lower
+              if [ -z "$bid" ]; then echo 1; return; fi    # B ran out -> A higher
+              local a_num=0 b_num=0
+              case "$aid" in *[!0-9]*) a_num=0;; *) a_num=1;; esac
+              case "$bid" in *[!0-9]*) b_num=0;; *) b_num=1;; esac
+              if [ "$a_num" = 1 ] && [ "$b_num" = 1 ]; then
+                if [ "$aid" -lt "$bid" ]; then echo -1; return; fi
+                if [ "$aid" -gt "$bid" ]; then echo 1; return; fi
+              elif [ "$a_num" = 1 ]; then
+                echo -1; return   # numeric identifier < non-numeric identifier
+              elif [ "$b_num" = 1 ]; then
+                echo 1; return
+              else
+                if [[ "$aid" < "$bid" ]]; then echo -1; return; fi
+                if [[ "$aid" > "$bid" ]]; then echo 1; return; fi
+              fi
             done
             echo 0
           }
