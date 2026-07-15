@@ -346,16 +346,19 @@ jobs:
     secrets: inherit
 
   # --- record-release: POST deploy to admin (CL-4 source data; internalized) ----
-  # DEV-lane push (asymmetric): skipped — deploy-firebase's in-job "Notify admin (release record)"
-  # step already POSTs the same /api/platform/ingest/release-logs endpoint, so this separate 1-min
-  # job is a duplicate on that lane. Default false => unchanged.
+  # Runs on BOTH lanes now (2026-07-15 fix). It PREVIOUSLY skipped the asymmetric dev lane on the
+  # theory that deploy-firebase posts the same /api/platform/ingest/release-logs endpoint in-job — but
+  # that in-job record did NOT reliably land, so the admin snapshot's DEV version lagged, and the next
+  # prod promotion's cl4-gate false-failed INV-2/INV-4 ("dev must deploy the exact target first"),
+  # forcing a manual `apphosting:rollouts:create`. Running record-release as a proper TRACKED job on the
+  # dev push guarantees the dev version records after a successful deploy-dev. The receiver upserts by
+  # (project, version, env) so a duplicate POST is idempotent — safe if deploy-firebase also posts.
   record-release:
     needs: [env-select, version, deploy-dev, deploy-prod]
     if: |
       always() && inputs.record_release &&
       github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') &&
-      (needs.deploy-dev.result == 'success' || needs.deploy-prod.result == 'success') &&
-      !(inputs.asymmetric_lanes && github.ref == 'refs/heads/dev')
+      (needs.deploy-dev.result == 'success' || needs.deploy-prod.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
