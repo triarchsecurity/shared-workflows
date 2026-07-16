@@ -353,12 +353,23 @@ jobs:
   # forcing a manual `apphosting:rollouts:create`. Running record-release as a proper TRACKED job on the
   # dev push guarantees the dev version records after a successful deploy-dev. The receiver upserts by
   # (project, version, env) so a duplicate POST is idempotent — safe if deploy-firebase also posts.
+  #
+  # 2026-07-16 fix: FAH-native repos (Firebase App Hosting deploys directly off the GitHub push, not the
+  # CI deploy-dev/deploy-prod job) leave those jobs SKIPPED, never 'success'. The old guard required
+  # 'success', so record-release SKIPPED on every FAH-native push → the admin snapshot never recorded a
+  # dev version → cl4-gate INV-1 ("no dev release recorded") false-blocked EVERY prod promotion, forcing a
+  # manual apphosting:rollouts:create each time (atlas, 2026-07-16). Fix: gate PER-LANE and record unless
+  # that lane's deploy actively FAILED/was cancelled — so 'success' (CI-deploy) AND 'skipped' (FAH-native)
+  # both record, while a real deploy failure still does not. (A branch-agnostic `|| deploy-prod == skipped`
+  # would wrongly fire on a dev push, where deploy-prod is ALWAYS skipped, even if deploy-dev failed.)
   record-release:
     needs: [env-select, version, deploy-dev, deploy-prod]
     if: |
-      always() && inputs.record_release &&
-      github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') &&
-      (needs.deploy-dev.result == 'success' || needs.deploy-prod.result == 'success')
+      always() && inputs.record_release && github.event_name == 'push' &&
+      (
+        (github.ref == 'refs/heads/dev' && needs.deploy-dev.result != 'failure' && needs.deploy-dev.result != 'cancelled') ||
+        (github.ref == 'refs/heads/main' && needs.deploy-prod.result != 'failure' && needs.deploy-prod.result != 'cancelled')
+      )
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
