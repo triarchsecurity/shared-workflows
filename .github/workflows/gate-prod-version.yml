@@ -72,10 +72,10 @@ on:
         type: string
         default: 'https://crm.triarchsecurity.com'
       min_dev_age_seconds:
-        description: 'Minimum age of the dev deploy before prod is allowed. Default 300 (5 min) — gives any post-deploy smoke tests time to run. Set to 0 to disable.'
+        description: 'Minimum age of the dev deploy before prod is allowed (INV-5 dev soak). Default 0 = DISABLED (2026-07-18: the soak hard-failed promotions that were seconds too early, wasting a full CI run; principal removed it). Set > 0 per-repo to re-enable a bake window.'
         required: false
         type: number
-        default: 300
+        default: 0
     secrets:
       # required:false so the canonical ci-cd.yml is referenceable by non-deploying
       # repos (GitHub validates required secrets at startup for every referenced
