@@ -120,6 +120,26 @@ on:
         description: 'Forwarded to quality-gate: run tests on push events too (default false — PRs are the tested path).'
         type: boolean
         default: false
+      dev_lane_test_command:
+        description: >
+          ONLY meaningful with asymmetric_lanes=true. The blocking vitest command the DEV lane
+          (PR base=dev, and push-to-dev when tests_on_push) runs. Empty (the default) reproduces the
+          pre-2026-08-08 behaviour EXACTLY — the DEV lane runs no tests — so every repo that does not
+          set this is byte-for-byte unchanged.
+
+          WHY IT EXISTS: asymmetric_lanes was adopted as a COST cut, and it blanks test_command on the
+          DEV lane. But a feature->dev PR already pays for a full runner (npm ci + next build); adding a
+          vitest STEP inside that already-running job costs seconds of wall clock and ZERO extra billed
+          jobs, because GitHub bills by job. Measured in atlas on 2026-08-08: the folded suite step was
+          38s inside a 4m26s gate job. Blanking it bought ~38s and cost every feature branch its only
+          pre-merge correctness signal — six phases reached dev with build-only CI behind them, and one
+          of those merges shipped an undefined CSS token to two live pages that the repo already had a
+          passing test for. Set this to the same command as test_command (or a fast CI-safe subset) so a
+          defect fails a check BEFORE it reaches dev instead of after it reaches prod.
+
+          The PROD lane is untouched: it always runs test_command.
+        type: string
+        default: ''
       asymmetric_lanes:
         description: >
           Opt-in: bare-bones DEV lane (minimal PR-to-dev signal, deploy-only push-to-dev) + full robust
@@ -178,7 +198,9 @@ jobs:
       # Scans: default = dev path (not main). Asymmetric = PROD lane (main) only.
       run_security_scans: ${{ inputs.asymmetric_lanes && (github.ref == 'refs/heads/main' || github.base_ref == 'main') || (!inputs.asymmetric_lanes && !(github.ref == 'refs/heads/main' || github.base_ref == 'main')) }}
       # Folded guard suites: run on the PROD lane (or always when not asymmetric); blanked on the DEV lane.
-      test_command: ${{ (!inputs.asymmetric_lanes || github.base_ref == 'main' || github.ref == 'refs/heads/main') && inputs.test_command || '' }}
+      # PROD lane (or non-asymmetric) => test_command. DEV lane => dev_lane_test_command, which
+      # defaults to '' — the previous behaviour — so this is a no-op for every repo that leaves it unset.
+      test_command: ${{ (!inputs.asymmetric_lanes || github.base_ref == 'main' || github.ref == 'refs/heads/main') && inputs.test_command || inputs.dev_lane_test_command }}
       tests_on_push: ${{ inputs.tests_on_push }}
       # Forwarded so the gate can skip the scans + conformance JOBS on the DEV lane (default false = no-op).
       asymmetric_lanes: ${{ inputs.asymmetric_lanes }}
@@ -192,10 +214,11 @@ jobs:
   # always() so a RED gate still reports its results (RED is the truth). No-ops cleanly (::notice::)
   # when the artifact is absent (docs-only PR, or a repo that sets no test_command) or the ingest
   # secret is unset — safe to leave on for every consumer repo.
-  # DEV-lane PRs run no folded tests, so there is no vitest-report to telemetry — skip the job entirely.
+  # A DEV-lane PR runs folded tests only when dev_lane_test_command is set; when it is unset there is no
+  # vitest-report to telemetry, so skip the job entirely (unchanged for every repo that leaves it unset).
   report-tests:
     needs: [quality-gate]
-    if: always() && inputs.report_tests && github.event_name == 'pull_request' && !(inputs.asymmetric_lanes && github.base_ref == 'dev')
+    if: always() && inputs.report_tests && github.event_name == 'pull_request' && !(inputs.asymmetric_lanes && github.base_ref == 'dev' && inputs.dev_lane_test_command == '')
     uses: triarchsecurity/shared-workflows/.github/workflows/test-telemetry.yml@release/v9
     with:
       report_artifact: vitest-report
