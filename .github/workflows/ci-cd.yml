@@ -463,6 +463,65 @@ jobs:
             echo "::warning::Release log POST failed (HTTP $HTTP_CODE): $BODY — next prod cl4-gate will reflect drift."
           fi
 
+      # ── SECOND RECEIVER: the Triarch console at admin.triarch.dev ───────────────────────────────
+      #
+      # This is a DUAL-WRITE, deliberately, not a repoint. The POST above targets
+      # crm.triarchsecurity.com — which is Atlas, the advisory PRODUCT, not an operator console. Every
+      # repo in the portfolio has been filing its release history into a customer-facing application
+      # because that is where the endpoint happened to live.
+      #
+      # It cannot simply be redirected: `cl4-gate` reads the row that same POST creates (see
+      # gate-prod-version.yml, GET /api/platform/version-snapshot). Cutting it would turn the prod
+      # version gate red across seven repos to fix a routing problem. So both receivers get the same
+      # payload until the console can answer the gate's question, and then the first one is removed.
+      #
+      # Failure here is a WARNING and never fails the job. This step exists to make the console's
+      # Releases page real; it must not become a new way for a deploy to fail. Note the asymmetry
+      # with the POST above — that one warns because the gate degrades gracefully; this one warns
+      # because a console losing one release event is strictly less bad than a blocked deploy.
+      #
+      # Auth: a per-product console key (`tri_<product>_…`). The console derives the product FROM THE
+      # KEY and never reads it from the body, so a repo cannot file releases as another product. When
+      # the secret is unset the step no-ops loudly, which is how a repo opts in — set the secret, and
+      # its releases start appearing with no code change.
+      - name: POST release to the Triarch console (dual-write)
+        env:
+          CONSOLE_INGEST_TOKEN: ${{ secrets.CONSOLE_INGEST_TOKEN }}
+          ENV_NAME: ${{ needs.env-select.outputs.environment }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PROJECT_KEY: ${{ inputs.project_key }}
+          GH_SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ -z "$CONSOLE_INGEST_TOKEN" ]; then
+            echo "::notice::CONSOLE_INGEST_TOKEN not set for ${PROJECT_KEY} — console will keep reading this product as NEVER on admin.triarch.dev/releases. Set the secret to wire it."
+            exit 0
+          fi
+          BRANCH="${REF#refs/heads/}"
+          DEPLOYED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # `generatedAt` is REQUIRED by /api/ingest/release and is not the same field as
+          # `deployedAt`. Found by posting this exact payload against the live door before shipping:
+          # without it the endpoint returns 400 generatedAt_required, which this step would have
+          # swallowed into its warning branch — a quiet line in every deploy log across seven repos
+          # while the console showed every product as stale. Both fields carry the deploy timestamp;
+          # they are distinct because generatedAt is the ENVELOPE's clock (when the sender produced
+          # the report) and deployedAt is the payload's (when the thing went live). On a retry they
+          # differ, which is the whole reason the console records both.
+          CONSOLE_PAYLOAD=$(jq -n \
+            --arg version "v$VERSION" --arg env "$ENV_NAME" --arg generatedAt "$DEPLOYED_AT" \
+            --arg commitSha "$GH_SHA" --arg deployedAt "$DEPLOYED_AT" --arg branch "$BRANCH" \
+            '{generatedAt:$generatedAt,version:$version,env:$env,commitSha:$commitSha,deployedAt:$deployedAt,branch:$branch}')
+          CODE=$(curl -s --max-time 15 --retry 3 --retry-all-errors -o /tmp/console-resp.txt -w "%{http_code}" \
+            -X POST "https://admin.triarch.dev/api/ingest/release" \
+            -H "Authorization: Bearer $CONSOLE_INGEST_TOKEN" -H "Content-Type: application/json" \
+            -d "$CONSOLE_PAYLOAD" || echo "000")
+          RESP=$(head -c 400 /tmp/console-resp.txt 2>/dev/null || echo "")
+          if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then
+            echo "✓ Console release recorded (HTTP $CODE): $RESP"
+          else
+            echo "::warning::Console release POST failed (HTTP $CODE): $RESP — admin.triarch.dev/releases will show this product as stale."
+          fi
+
   # --- notify: FAH rollout poll + Slack -----------------------------------------
   notify:
     needs: [quality-gate, env-select, version, deploy-dev, deploy-prod]
