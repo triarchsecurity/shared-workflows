@@ -150,6 +150,29 @@ on:
           repos leave this false => behavior is byte-for-byte identical to the plain overhaul.
         type: boolean
         default: false
+      single_lane:
+        description: >
+          Opt-in: ONE deployable branch (main). Skips the two jobs that exist only to enforce the
+          three-branch promotion chain — `pr-source` (main may only receive PRs from dev, release/*
+          or hotfix/*) and `verify-dev-deployed` (the dev-must-deploy-first ancestry check). Nothing
+          else changes: quality-gate, security scans, version-consistency, cl4-gate, record-release
+          and the prod `environment:` binding all still run on the prod lane.
+
+          WHY IT EXISTS. Those two gates protect CUSTOMERS from a bad prod deploy by forcing every
+          change through a soak environment first. A repo with no customers pays for that protection
+          in run COUNT: measured in atlas on 2026-08-16, ONE change cost FIVE runs (feature->dev PR,
+          push-to-dev, dev->main PR, review gate, push-to-main), at 54 runs in a single day. Per-run
+          duration was already fine at 4-6 min — the promotion chain itself was the cost.
+
+          It also removes a failure mode the chain creates. atlas-dev reported a successful "deploy
+          to dev" on every dev push while producing NO rollout for five days, so the soak environment
+          served stale code and laundered that staleness as verification. An environment nobody is
+          genuinely promoting through is worse than no environment at all.
+
+          Default false => every non-adopting repo renders byte-for-byte the same job set as before.
+          Flipping it back restores the promotion chain exactly; nothing here is one-way.
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-cd-${{ github.event_name }}-${{ github.ref }}
@@ -164,7 +187,7 @@ jobs:
   # Main may only receive PRs from dev / release/* / hotfix/*. Triggers on edited
   # so a base-branch retarget is re-checked (review gap C6).
   pr-source:
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    if: ${{ !inputs.single_lane && github.event_name == 'pull_request' && github.base_ref == 'main' }}
     runs-on: ubuntu-latest
     steps:
       - name: Enforce PR source for main
@@ -297,7 +320,7 @@ jobs:
   # --- GATE: dev-must-deploy-first ancestry check (prod only) -------------------
   verify-dev-deployed:
     needs: env-select
-    if: needs.env-select.outputs.environment == 'prod'
+    if: ${{ !inputs.single_lane && needs.env-select.outputs.environment == 'prod' }}
     uses: triarchsecurity/shared-workflows/.github/workflows/verify-dev-deployed.yml@release/v9
 
   # --- GATE: CL-4 prod-version invariants (prod only). Centralized for ALL prod
@@ -314,9 +337,17 @@ jobs:
 
   # --- GATE: GitHub Environment binding (prod only). No reviewer by default
   #     (preserves current behavior; opt-in approval via repo env settings). ----
+  # `always()` + the explicit result checks (rather than a bare `if`) so this job still RUNS when
+  # verify-dev-deployed is SKIPPED under single_lane. Without it, GitHub's default skip-cascade would
+  # take the prod `environment:` binding down with the ancestry gate — and that binding is the one
+  # prod guard single_lane deliberately KEEPS. env-select's own result is asserted so a genuine
+  # upstream failure still stops here.
   gate-prod:
     needs: [env-select, verify-dev-deployed]
-    if: needs.env-select.outputs.environment == 'prod'
+    if: |
+      always() && needs.env-select.result == 'success' &&
+      needs.env-select.outputs.environment == 'prod' &&
+      (needs.verify-dev-deployed.result == 'success' || needs.verify-dev-deployed.result == 'skipped')
     runs-on: ubuntu-latest
     environment: prod
     steps:
