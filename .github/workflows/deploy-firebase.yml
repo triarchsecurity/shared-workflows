@@ -273,16 +273,39 @@ jobs:
             #    ref. A genuine FAILED/CANCELLED => exit non-zero (NOT a REST-call failure → NO CLI
             #    fallback; a rebuild would just re-fail). Timeout => pass through (notify.yml reports the
             #    final state); atlas FAH builds run ~6-7 min, budget 25 min under the 30-min job cap.
-            local start elapsed state
+            local start elapsed state rjson blanks
             start=$(date +%s)
+            blanks=0
             while true; do
               elapsed=$(( $(date +%s) - start ))
               if [ "$elapsed" -ge 1500 ]; then
                 echo "::warning::Rollout still running after ${elapsed}s — not blocking (notify.yml reports final state)"; return 0
               fi
-              state=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" "${api}/rollouts?pageSize=10" 2>/dev/null \
-                | jq -r --arg B "$build_name" '.rollouts[]? | select(.build==$B) | .state' 2>/dev/null | head -1)
-              state="${state:-PENDING}"
+              # GET THE ROLLOUT BY ID. This listed `rollouts?pageSize=10` and picked ours out with
+              # `select(.build==$B)` — but the list endpoint is NOT ordered by createTime, so on a
+              # backend with any history those ten rows are effectively arbitrary and OUR rollout is
+              # not among them. Measured on atlas 2026-08-21: pageSize=10 returned rollouts created
+              # 2026-08-17 and 2026-07-05 while the rollout being polled had been created seconds
+              # before. `select` matched nothing on every iteration, forever.
+              #
+              # The rollout is created with `rolloutId=${build_id}`, so its resource name is known
+              # exactly. A direct GET removes the ordering assumption rather than making it less wrong.
+              rjson=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" "${api}/rollouts/${build_id}" 2>/dev/null)
+              state=$(printf '%s' "$rjson" | jq -r '.state // empty' 2>/dev/null)
+              # AN UNREADABLE STATE IS NOT "PENDING". `${state:-PENDING}` turned "I cannot find it"
+              # into "it is still running" — which is exactly what disguised a lookup bug as a slow
+              # deploy: the loop ran to its 1500s cap on EVERY push, warned, and returned 0. Measured
+              # cost on atlas: deploy-prod 25m33s while the rollout it watched finished in 8m42s.
+              if [ -z "$state" ]; then
+                blanks=$(( blanks + 1 ))
+                if [ "$blanks" -ge 5 ]; then
+                  echo "::error::Rollout ${build_id} not readable after ${blanks} attempts (${elapsed}s). Last response:"
+                  printf '%s\n' "$rjson" | head -c 400
+                  return 1
+                fi
+                echo "  state=<unreadable> (${blanks}/5) elapsed=${elapsed}s — retrying"; sleep 20; continue
+              fi
+              blanks=0
               case "$state" in
                 STATE_SUCCESS|SUCCESS|SUCCEEDED) echo "✓ Rollout SUCCEEDED in ${elapsed}s"; return 0 ;;
                 STATE_FAILED|FAILED|STATE_CANCELLED|CANCELLED) echo "::error::Rollout $state after ${elapsed}s"; return 1 ;;
@@ -381,16 +404,39 @@ jobs:
               fi
             fi
             echo "Rollout created for build ${build_id}; polling to terminal state…"
-            local start elapsed state
+            local start elapsed state rjson blanks
             start=$(date +%s)
+            blanks=0
             while true; do
               elapsed=$(( $(date +%s) - start ))
               if [ "$elapsed" -ge 1500 ]; then
                 echo "::warning::Rollout still running after ${elapsed}s — not blocking"; return 0
               fi
-              state=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" "${api}/rollouts?pageSize=10" 2>/dev/null \
-                | jq -r --arg B "$build_name" '.rollouts[]? | select(.build==$B) | .state' 2>/dev/null | head -1)
-              state="${state:-PENDING}"
+              # GET THE ROLLOUT BY ID. This listed `rollouts?pageSize=10` and picked ours out with
+              # `select(.build==$B)` — but the list endpoint is NOT ordered by createTime, so on a
+              # backend with any history those ten rows are effectively arbitrary and OUR rollout is
+              # not among them. Measured on atlas 2026-08-21: pageSize=10 returned rollouts created
+              # 2026-08-17 and 2026-07-05 while the rollout being polled had been created seconds
+              # before. `select` matched nothing on every iteration, forever.
+              #
+              # The rollout is created with `rolloutId=${build_id}`, so its resource name is known
+              # exactly. A direct GET removes the ordering assumption rather than making it less wrong.
+              rjson=$(curl -sS --max-time 20 -H "Authorization: Bearer $GCP_TOKEN" "${api}/rollouts/${build_id}" 2>/dev/null)
+              state=$(printf '%s' "$rjson" | jq -r '.state // empty' 2>/dev/null)
+              # AN UNREADABLE STATE IS NOT "PENDING". `${state:-PENDING}` turned "I cannot find it"
+              # into "it is still running" — which is exactly what disguised a lookup bug as a slow
+              # deploy: the loop ran to its 1500s cap on EVERY push, warned, and returned 0. Measured
+              # cost on atlas: deploy-prod 25m33s while the rollout it watched finished in 8m42s.
+              if [ -z "$state" ]; then
+                blanks=$(( blanks + 1 ))
+                if [ "$blanks" -ge 5 ]; then
+                  echo "::error::Rollout ${build_id} not readable after ${blanks} attempts (${elapsed}s). Last response:"
+                  printf '%s\n' "$rjson" | head -c 400
+                  return 1
+                fi
+                echo "  state=<unreadable> (${blanks}/5) elapsed=${elapsed}s — retrying"; sleep 20; continue
+              fi
+              blanks=0
               case "$state" in
                 STATE_SUCCESS|SUCCESS|SUCCEEDED) echo "✓ Rollout SUCCEEDED in ${elapsed}s"; return 0 ;;
                 STATE_FAILED|FAILED|STATE_CANCELLED|CANCELLED) echo "::error::Rollout $state after ${elapsed}s"; return 1 ;;
