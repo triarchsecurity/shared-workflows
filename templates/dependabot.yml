@@ -1,0 +1,59 @@
+# Dependabot — the only thing in this portfolio that opens a pull request which
+# actually fixes a vulnerable dependency.
+#
+# ── WHY THIS FILE EXISTS AT ALL ─────────────────────────────────────────────
+# There was no dependabot.yml in any Triarch repository until 2026-09-14. That
+# did not mean Dependabot was off — GitHub runs SECURITY updates without a
+# config — it meant Dependabot had never been configured, only endured. One
+# repository was carrying 15 open pull requests as a result, which is how a
+# useful tool comes to be described as noise and then switched off.
+#
+# ── SECURITY UPDATES ONLY ───────────────────────────────────────────────────
+# `open-pull-requests-limit: 0` disables VERSION updates — routine bumps of
+# dependencies that have nothing wrong with them. It does NOT disable security
+# updates, which ignore this limit by design. The distinction is the whole
+# configuration: we want the fixes and not the churn.
+#
+# ── GROUPED, SO A WEEK IS ONE REVIEW ────────────────────────────────────────
+# Ungrouped, ten advisories are ten pull requests, ten CI runs and ten reviews
+# of the same lockfile. Grouped they are one.
+#
+# ── AND THE CONSOLE DECIDES WHICH ONES TO ACT ON ────────────────────────────
+# `dependabot-verdict.yml` asks the Triarch console whether each pull request is
+# one the register agrees is worth acting on — assessed severity, EPSS, KEV, and
+# the SSVC outcome, rather than the advisory's own label. Dependabot offers the
+# fix; the console says whether to take it. An advisory the register has never
+# seen is UNASSESSED and is never blocked: the register being behind is our
+# problem, not evidence the fix is unnecessary.
+
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:00'
+      timezone: America/Chicago
+    # Version updates off; security updates are unaffected by this and still arrive.
+    open-pull-requests-limit: 0
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ['*']
+    labels:
+      - dependencies
+      - security
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+    groups:
+      actions:
+        applies-to: security-updates
+        patterns: ['*']
+    labels:
+      - dependencies
+      - security

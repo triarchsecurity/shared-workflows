@@ -1,0 +1,117 @@
+name: Dependabot Verdict
+
+# Ask the console whether a Dependabot pull request is worth merging.
+#
+# ── DEPENDABOT OFFERS THE FIX AND HAS NO OPINION ON IT ──────────────────────
+# It reads the advisory database and nothing else. The console has the opinion:
+# assessed severity, EPSS, KEV and an SSVC outcome, per finding, per product.
+# This is the join — asked once per pull request, answered in a comment.
+#
+# ── UNASSESSED DOES NOT BLOCK, AND THAT IS DELIBERATE ───────────────────────
+# Everywhere else this console treats an unknown as unknown and never as clean.
+# The same rule here produces the OPPOSITE action. Fail-closed is right when the
+# question is "may this caller in", because a wrong yes is an intrusion. It is
+# wrong when the question is "may this patch land", because a wrong no is an
+# unpatched vulnerability sitting behind a red check nobody can clear.
+#
+# The register being behind is our problem. It is not evidence the fix is
+# unnecessary, and it must not be allowed to read as though it were.
+#
+# ── A DISAGREEMENT CLOSES THE PR, IT DOES NOT LEAVE IT RED ──────────────────
+# When the register says a finding is assessed away, the honest outcome is that
+# the pull request is not acted on — not that it sits open and failing forever.
+# A permanently red PR is how a gate gets ignored, and then switched off.
+
+on:
+  workflow_call:
+    inputs:
+      product:
+        description: 'The console product key. Must agree with registry.ts.'
+        required: true
+        type: string
+      admin_url:
+        type: string
+        default: 'https://admin.triarch.dev'
+      dry_run_title:
+        description: >-
+          A pull-request title to judge WITHOUT commenting or closing anything.
+          Exists because the gate's destructive half — closing a pull request —
+          cannot be rehearsed on a real one, and pointing an untested closer at
+          eight repositories is how a useful gate becomes the thing that ate a
+          security fix.
+        type: string
+        default: ''
+    secrets:
+      VULN_READ_KEY:
+        description: >-
+          A machine key for this product holding `read` and nothing else. Distinct
+          from the scan key on purpose: this one only asks questions, and a key
+          that cannot write is a key whose leak costs a disclosure rather than a
+          forged finding.
+        required: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  verdict:
+    # Dependabot's own pull requests, or an explicit dry run. Nothing else — a gate that judged
+    # every pull request would comment on human work it has no opinion about.
+    if: github.actor == 'dependabot[bot]' || inputs.dry_run_title != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask the register
+        id: ask
+        env:
+          KEY: ${{ secrets.VULN_READ_KEY }}
+          TITLE: ${{ inputs.dry_run_title != '' && inputs.dry_run_title || github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          # The title goes over whole. Dependabot's titles vary, and a regex living in eight
+          # workflow files is eight regexes to keep in agreement — the console parses it once.
+          RESP=$(curl -fsS --max-time 30 -G \
+            -H "Authorization: Bearer $KEY" \
+            --data-urlencode "title=$TITLE" \
+            "${{ inputs.admin_url }}/api/vuln/verdict" || echo '{"ok":false}')
+          echo "resp<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$RESP" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "verdict=$(echo "$RESP" | jq -r '.verdict // "unreachable"')" >> "$GITHUB_OUTPUT"
+          echo "actionable=$(echo "$RESP" | jq -r '.actionable // true')" >> "$GITHUB_OUTPUT"
+          echo "reason=$(echo "$RESP" | jq -r '.reason // "The console could not be reached. Unassessed does not block: merge on the advisory'"'"'s own merits."')" >> "$GITHUB_OUTPUT"
+
+      # A dry run prints the verdict and stops. It exercises the decision — the key, the door, the
+      # register's answer — without the two halves that touch a pull request.
+      - name: Dry run stops here
+        if: inputs.dry_run_title != ''
+        run: |
+          echo "DRY RUN — title: $DRY_TITLE"
+          echo "${{ steps.ask.outputs.resp }}" | jq .
+        env:
+          DRY_TITLE: ${{ inputs.dry_run_title }}
+
+      - name: Say what the register said
+        if: inputs.dry_run_title == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERDICT: ${{ steps.ask.outputs.verdict }}
+          REASON: ${{ steps.ask.outputs.reason }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body \
+            "**Register verdict: \`$VERDICT\`**
+
+          $REASON
+
+          _Asked of the Triarch console, which holds the assessed severity, EPSS, KEV listing and SSVC outcome for this product. Unassessed never blocks a patch._"
+
+      # Closed, not left failing. "Not acted on" is the outcome the register asked for, and a
+      # permanently red pull request is how a gate gets ignored and then switched off.
+      - name: Close what the register does not want acted on
+        if: inputs.dry_run_title == '' && steps.ask.outputs.actionable == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr close "${{ github.event.pull_request.number }}" \
+            --comment "Closed on the register's verdict. The finding stays open and tracked — assessed away is not fixed, and this bump remains available whenever the dependency is touched anyway."

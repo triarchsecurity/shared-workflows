@@ -1,0 +1,102 @@
+name: Vuln Scan
+
+# Nightly dependency scan, posted to the Triarch console.
+#
+# ── WHY A REUSABLE WORKFLOW AND NOT A FILE PER REPO ─────────────────────────
+# Eight repositories need the identical job. Copied eight times it drifts eight
+# ways, and the first thing to drift is the thing nobody reads — the enrichment
+# step that resolves GHSA to CVE, without which every finding arrives unscored
+# and the console's assessment layer goes inert. That layer sat inert across
+# 2054 findings for months; it does not need a second way to get there.
+#
+# ── SCHEDULED, NOT ON PUSH ──────────────────────────────────────────────────
+# The advisory database changes without the code changing. A scan that only ran
+# on push would report a repository as clean for as long as nobody touched it,
+# which is exactly backwards: an untouched repository accrues vulnerabilities
+# while it sits there, and the quiet ones are the ones nobody is watching.
+#
+# ── A CLEAN REPO STILL POSTS ────────────────────────────────────────────────
+# Zero findings is a RESULT. Silence would make a healthy repository
+# indistinguishable from one whose workflow quietly stopped running, and the
+# console's whole argument is that those two are different facts.
+
+on:
+  workflow_call:
+    inputs:
+      product:
+        description: >-
+          The console's product key for this repository. NOT the repo name — the
+          console derives the product from the API key and will refuse a
+          mismatch, so this is the key that must agree with `registry.ts`.
+        required: true
+        type: string
+      node_version:
+        type: string
+        default: '22'
+      admin_url:
+        type: string
+        default: 'https://admin.triarch.dev'
+      working_directory:
+        description: 'Where the lockfile lives, for repos whose app is not at the root.'
+        type: string
+        default: '.'
+      transformer_ref:
+        description: >-
+          The shared-workflows ref the scan script is taken from. Pinned so a
+          scan is reproducible: the script that ran yesterday and the one
+          running today are the same script unless somebody changed this line.
+        type: string
+        default: 'main'
+    secrets:
+      VULN_INGEST_KEY:
+        description: >-
+          A machine key minted for this product with the `ingest` capability and
+          nothing else. Since migration 0085 a product may hold several keys, so
+          this is a dedicated scan key sitting alongside whatever else the
+          product uses — revoking it stops the scan and breaks nothing else.
+        required: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      # Checked out at a PINNED ref rather than curl'd from a raw URL. Both
+      # work — this repository is public — but a raw fetch resolves to whatever
+      # the branch holds at the moment the job runs, so the script that scanned
+      # yesterday and the one scanning today can differ with nothing recording
+      # it. A ref is a version; a URL is a hope.
+      - name: Check out the scan transformer
+        uses: actions/checkout@v4
+        with:
+          repository: triarchsecurity/shared-workflows
+          ref: ${{ inputs.transformer_ref }}
+          path: .shared-workflows
+          persist-credentials: false
+
+      # `npm ci` is deliberately NOT run. `npm audit` reads the lockfile, and
+      # installing would spend minutes to learn nothing extra — while making a
+      # scan fail for a reason that has nothing to do with vulnerabilities.
+
+      - name: Scan and post
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          # Lifts the GitHub advisory API rate limit for the GHSA -> CVE lookup.
+          # Without a CVE there is no EPSS and no KEV, and the console's
+          # exploitability factor requires both — so an unauthenticated run
+          # silently produces findings nothing can assess.
+          GITHUB_TOKEN: ${{ github.token }}
+          VULN_INGEST_KEY: ${{ secrets.VULN_INGEST_KEY }}
+        run: |
+          node "$GITHUB_WORKSPACE/.shared-workflows/scripts/npm-audit-to-scan.mjs" \
+            --product "${{ inputs.product }}" \
+            --url "${{ inputs.admin_url }}" \
+            --key "$VULN_INGEST_KEY"
