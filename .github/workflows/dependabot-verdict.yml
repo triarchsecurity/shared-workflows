@@ -17,6 +17,17 @@ name: Dependabot Verdict
 # The register being behind is our problem. It is not evidence the fix is
 # unnecessary, and it must not be allowed to read as though it were.
 #
+# ── ONLY A STRUCTURAL REASON MAY CLOSE A PULL REQUEST ───────────────────────
+# `low-urgency` is actionable. A finding reduced only by EPSS — a forecast about
+# the world — is deprioritised, never vetoed: the gate says merge it when
+# convenient rather than closing the fix. Closing requires a reason about THIS
+# system (not reachable, not shipped, behind auth), which is checkable.
+#
+# Measured: the gate would otherwise have closed a Dependabot PR fixing an
+# unauthenticated Next.js RCE on a 2.5% exploitation score. Right call, wrong
+# reason — the advisory is Windows-only and this runs on Linux, and nothing in
+# the decision knew that.
+#
 # ── A DISAGREEMENT CLOSES THE PR, IT DOES NOT LEAVE IT RED ──────────────────
 # When the register says a finding is assessed away, the honest outcome is that
 # the pull request is not acted on — not that it sits open and failing forever.
