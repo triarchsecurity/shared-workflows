@@ -32,6 +32,15 @@ on:
       admin_url:
         type: string
         default: 'https://admin.triarch.dev'
+      dry_run_title:
+        description: >-
+          A pull-request title to judge WITHOUT commenting or closing anything.
+          Exists because the gate's destructive half — closing a pull request —
+          cannot be rehearsed on a real one, and pointing an untested closer at
+          eight repositories is how a useful gate becomes the thing that ate a
+          security fix.
+        type: string
+        default: ''
     secrets:
       VULN_READ_KEY:
         description: >-
@@ -47,7 +56,9 @@ permissions:
 
 jobs:
   verdict:
-    if: github.actor == 'dependabot[bot]'
+    # Dependabot's own pull requests, or an explicit dry run. Nothing else — a gate that judged
+    # every pull request would comment on human work it has no opinion about.
+    if: github.actor == 'dependabot[bot]' || inputs.dry_run_title != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -55,7 +66,7 @@ jobs:
         id: ask
         env:
           KEY: ${{ secrets.VULN_READ_KEY }}
-          TITLE: ${{ github.event.pull_request.title }}
+          TITLE: ${{ inputs.dry_run_title != '' && inputs.dry_run_title || github.event.pull_request.title }}
         run: |
           set -euo pipefail
           # The title goes over whole. Dependabot's titles vary, and a regex living in eight
@@ -71,7 +82,18 @@ jobs:
           echo "actionable=$(echo "$RESP" | jq -r '.actionable // true')" >> "$GITHUB_OUTPUT"
           echo "reason=$(echo "$RESP" | jq -r '.reason // "The console could not be reached. Unassessed does not block: merge on the advisory'"'"'s own merits."')" >> "$GITHUB_OUTPUT"
 
+      # A dry run prints the verdict and stops. It exercises the decision — the key, the door, the
+      # register's answer — without the two halves that touch a pull request.
+      - name: Dry run stops here
+        if: inputs.dry_run_title != ''
+        run: |
+          echo "DRY RUN — title: $DRY_TITLE"
+          echo "${{ steps.ask.outputs.resp }}" | jq .
+        env:
+          DRY_TITLE: ${{ inputs.dry_run_title }}
+
       - name: Say what the register said
+        if: inputs.dry_run_title == ''
         env:
           GH_TOKEN: ${{ github.token }}
           VERDICT: ${{ steps.ask.outputs.verdict }}
@@ -87,7 +109,7 @@ jobs:
       # Closed, not left failing. "Not acted on" is the outcome the register asked for, and a
       # permanently red pull request is how a gate gets ignored and then switched off.
       - name: Close what the register does not want acted on
-        if: steps.ask.outputs.actionable == 'false'
+        if: inputs.dry_run_title == '' && steps.ask.outputs.actionable == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

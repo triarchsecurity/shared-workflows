@@ -198,7 +198,30 @@ for (const f of findings) {
   delete f._cve;
 }
 
+/**
+ * Did this run actually look at a dependency tree?
+ *
+ * ── WHY ZERO FINDINGS IS NOT ENOUGH TO CLAIM CLEAN ───────────────────────────────────────────────
+ * `npm audit` exits 0 with an empty result in several situations that are not "this repository is
+ * clean": no lockfile at the working directory, a workspace root with no dependencies of its own, a
+ * checkout that landed somewhere unexpected. Each produces the same empty array a genuinely clean
+ * repository produces, and the console's door closes every open finding when it receives one.
+ *
+ * It refuses to unless the scan ASSERTS `confirmedClean`, and this is where that assertion is
+ * earned: npm has to have seen dependencies. A tree of zero packages was not audited, it was
+ * missed — and the difference is 168 findings, measured on darksouls the day this was written.
+ */
+const depsSeen = Number(audit.metadata?.dependencies?.total
+  ?? audit.metadata?.totalDependencies ?? 0);
+const confirmedClean = findings.length === 0 && depsSeen > 0;
+
+if (findings.length === 0 && depsSeen === 0) {
+  console.error('npm audit reported no findings AND no dependencies — nothing was audited. '
+    + 'Posting without confirmedClean, so the console will refuse rather than close what is open.');
+}
+
 const scan = {
+  confirmedClean,
   scanId: randomUUID(),
   startedAt,
   commitSha: process.env.GITHUB_SHA ?? null,
@@ -219,7 +242,8 @@ const summary = findings.reduce((acc, f) => {
  * successful, and quietly leave the assessed column equal to the raw one. Rendering the number is
  * what makes that visible in a log rather than six months later in a register.
  */
-console.log(`product=${product} findings=${findings.length} ${JSON.stringify(summary)}`
+console.log(`product=${product} findings=${findings.length} deps=${depsSeen}`
+  + ` clean=${confirmedClean} ${JSON.stringify(summary)}`
   + ` resolved=${cveById.size}/${findings.length} ghsa->cve`
   + ` kev=${kev ? 'fetched' : 'UNREACHABLE'} epss=${epss.size} scored`);
 
