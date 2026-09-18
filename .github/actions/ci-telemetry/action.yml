@@ -1,0 +1,121 @@
+name: CI run telemetry
+description: >
+  Reports THIS job's timing and outcome to the Triarch console (CI Run Telemetry Contract v1).
+  Runs as the last step of an existing job, so it costs no extra runner and no extra billed minute.
+  Never fails the job: every problem degrades to a warning.
+
+inputs:
+  enabled:
+    description: "'true' to send. Callers pass the expression vars.CI_TELEMETRY_ENABLED == 'true', so it is flipped per repo with no code change."
+    required: false
+    default: 'false'
+  console_token:
+    description: Per-product console key (CONSOLE_INGEST_TOKEN). The console derives the product from it.
+    required: false
+    default: ''
+  job_status:
+    description: "Pass the job.status expression — a composite action cannot read the job context itself."
+    required: true
+  started_at_epoch:
+    description: >
+      Unix seconds when the job began, recorded by the job's FIRST step
+      (`echo "CI_JOB_STARTED=$(date -u +%s)" >> "$GITHUB_ENV"`). Preferred: needs no API permission.
+      It misses only the few seconds of runner setup before step one.
+    required: false
+    default: ''
+  github_token:
+    description: Token with actions:read, used to read this job's start time from the jobs API.
+    required: false
+    default: ${{ github.token }}
+  app_version:
+    description: Version this run built or deployed, if known.
+    required: false
+    default: ''
+  target_env:
+    description: "'prod' or 'dev' when this job deployed; empty otherwise."
+    required: false
+    default: ''
+  console_url:
+    description: Console base URL.
+    required: false
+    default: https://admin.triarch.dev
+
+runs:
+  using: composite
+  steps:
+    - name: Report CI run telemetry
+      shell: bash
+      env:
+        ENABLED: ${{ inputs.enabled }}
+        CONSOLE_TOKEN: ${{ inputs.console_token }}
+        JOB_STATUS: ${{ inputs.job_status }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        STARTED_EPOCH: ${{ inputs.started_at_epoch }}
+        APP_VERSION: ${{ inputs.app_version }}
+        TARGET_ENV: ${{ inputs.target_env }}
+        CONSOLE_URL: ${{ inputs.console_url }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -uo pipefail
+        [ "$ENABLED" = "true" ] || { echo "ci-telemetry: disabled (set repo variable CI_TELEMETRY_ENABLED=true to send)"; exit 0; }
+        [ -n "$CONSOLE_TOKEN" ] || { echo "::notice::ci-telemetry: no console token — skipped"; exit 0; }
+
+        NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        # The job's display name and API start time. Needs actions:read; without it this 403s and we fall
+        # back to GITHUB_JOB and the caller's first-step stamp. RUNNER_NAME is unique among the run's in-flight jobs, which is the
+        # only reliable way to find "me" from inside a reusable workflow, where job names are prefixed.
+        JOB_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+          --jq "[.jobs[] | select(.runner_name == \"${RUNNER_NAME}\" and .status == \"in_progress\")][0]" 2>/dev/null || echo "")
+        JOB_NAME=$(printf '%s' "$JOB_JSON" | jq -r '.name // empty' 2>/dev/null)
+        STARTED=$(printf '%s' "$JOB_JSON" | jq -r '.started_at // empty' 2>/dev/null)
+        START_S=""
+        if [ -n "$STARTED_EPOCH" ]; then
+          START_S="$STARTED_EPOCH"; STARTED=$(date -u -d "@$STARTED_EPOCH" +%Y-%m-%dT%H:%M:%SZ); TIMING=job-first-step
+        elif [ -n "$STARTED" ]; then
+          START_S=$(date -u -d "$STARTED" +%s); TIMING=jobs-api
+        fi
+        if [ -n "$START_S" ]; then
+          WALL=$(( $(date -u +%s) - START_S ))
+          [ "$WALL" -lt 0 ] && WALL=0
+          BILLED=$(( (WALL + 59) / 60 )); [ "$BILLED" -lt 1 ] && BILLED=1
+        else
+          # Unknown is reported as unknown — never as zero minutes.
+          WALL=null; BILLED=null; TIMING=unavailable; STARTED=""
+          echo "::warning::ci-telemetry: no start time (pass started_at_epoch, or grant actions:read) — timing sent as unknown"
+        fi
+        [ -n "$JOB_NAME" ] || JOB_NAME="$GITHUB_JOB"
+
+        BODY=$(jq -n \
+          --arg generatedAt "$NOW" \
+          --arg idem "ci-run:${GITHUB_REPOSITORY}:${GITHUB_RUN_ID}:${GITHUB_RUN_ATTEMPT}:${JOB_NAME}" \
+          --arg repo "$GITHUB_REPOSITORY" --arg workflow "$GITHUB_WORKFLOW" \
+          --argjson runId "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+          --arg runUrl "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+          --arg event "$GITHUB_EVENT_NAME" --arg ref "$GITHUB_REF" --arg sha "$GITHUB_SHA" \
+          --arg pr "${PR_NUMBER:-}" \
+          --arg job "$JOB_NAME" --arg status "$JOB_STATUS" --arg started "$STARTED" --arg completed "$NOW" \
+          --argjson wall "$WALL" --argjson billed "$BILLED" --arg timing "$TIMING" \
+          --arg os "${RUNNER_OS:-}" --arg arch "${RUNNER_ARCH:-}" \
+          --arg ver "${APP_VERSION#v}" --arg env "$TARGET_ENV" \
+          '{schemaVersion: 1, generatedAt: $generatedAt, idempotencyKey: $idem,
+            payload: {
+              kind: "ci-run", contract_version: 1,
+              repo: $repo, workflow: $workflow, run_id: $runId, run_attempt: $attempt, run_url: $runUrl,
+              event: $event, ref: $ref, head_sha: $sha,
+              pull_request: (if $pr == "" then null else ($pr|tonumber) end),
+              job: {name: $job, conclusion: $status,
+                    started_at: (if $started == "" then null else $started end), completed_at: $completed,
+                    wall_seconds: $wall, billed_minutes: $billed, timing_source: $timing,
+                    runner_os: $os, runner_arch: $arch, billing_multiplier: 1},
+              release: {app_version: (if $ver == "" then null else $ver end),
+                        target_env: (if $env == "" then null else $env end)}
+            }}')
+        CODE=$(curl -s --max-time 15 --retry 2 --retry-all-errors -o /tmp/ci-telemetry.txt -w '%{http_code}' \
+          -X POST "${CONSOLE_URL%/}/api/ingest/release" \
+          -H "Authorization: Bearer $CONSOLE_TOKEN" -H 'Content-Type: application/json' -d "$BODY" || echo 000)
+        if [ "$CODE" = 200 ] || [ "$CODE" = 201 ]; then
+          echo "ci-telemetry: recorded ${JOB_NAME} (wall=${WALL}s billed=${BILLED}min status=${JOB_STATUS} timing=${TIMING})"
+        else
+          echo "::warning::ci-telemetry: console POST HTTP $CODE: $(head -c 300 /tmp/ci-telemetry.txt 2>/dev/null)"
+        fi
+        exit 0
