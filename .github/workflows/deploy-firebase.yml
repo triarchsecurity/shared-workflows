@@ -36,6 +36,14 @@ on:
         required: false
         type: string
         default: 'prod'
+      console_record:
+        description: >
+          When true, also POST the release to the Triarch console (admin.triarch.dev/api/ingest/release) from
+          THIS job. Lets a caller drop its separate record job (a second runner = a second billed minute).
+          Default false: callers of ci-cd.yml already dual-write in record-release.
+        required: false
+        type: boolean
+        default: false
       wait_for_rollout:
         description: >
           When true (default), the REST apphosting path polls the rollout to a terminal state so the
@@ -64,6 +72,9 @@ on:
         required: false
       ADMIN_API_TOKEN:
         description: 'Per-project Bearer token for admin callback (valued with projects.apiKey from CRDB).'
+        required: false
+      CONSOLE_INGEST_TOKEN:
+        description: 'Per-product console key for admin.triarch.dev/api/ingest/release. Used only when console_record is true.'
         required: false
     outputs:
       version:
@@ -249,11 +260,24 @@ jobs:
             # 2) create the rollout referencing that build (it waits for the build to be READY).
             #    rolloutId is REQUIRED (HTTP 400 "must provide a rollout id" — atlas run 28835924838);
             #    reuse the gha build id, unique per run attempt. 'already exists' => idempotent retry.
-            local rhttp
-            rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
-              -X POST "${api}/rollouts?rolloutId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
-              -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
-              -d "{\"build\":\"${build_name}\"}")
+            # builds.create is ASYNCHRONOUS (it returns an operation): the build resource can take a few
+            # seconds to exist, and a rollouts.create fired in that window 400s with 'build "…" was not
+            # found and is invalid'. That fell through to the firebase-tools CLI, which BLOCKS on the whole
+            # server-side build (yourkith run 35301482944, 2026-09-18: 12 min / 14 billed instead of ~1).
+            # Retry just that error, briefly, before treating the REST path as unavailable.
+            local rhttp tries=0
+            while true; do
+              rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
+                -X POST "${api}/rollouts?rolloutId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
+                -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"build\":\"${build_name}\"}")
+              if [ "$rhttp" = "400" ] && grep -qiE 'was not found' /tmp/fah_roll.json && [ "$tries" -lt 12 ]; then
+                tries=$((tries + 1))
+                echo "  build ${build_id} not registered yet (${tries}/12) — retrying rollouts.create in 5s"
+                sleep 5; continue
+              fi
+              break
+            done
             if [ "$rhttp" != "200" ] && [ "$rhttp" != "201" ]; then
               if grep -qiE 'already exists' /tmp/fah_roll.json; then
                 echo "Rollout ${build_id} already exists (idempotent retry) — polling it."
@@ -391,11 +415,24 @@ jobs:
               fi
             fi
             # rolloutId is REQUIRED (HTTP 400 otherwise); 'already exists' => idempotent retry.
-            local rhttp
-            rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
-              -X POST "${api}/rollouts?rolloutId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
-              -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
-              -d "{\"build\":\"${build_name}\"}")
+            # builds.create is ASYNCHRONOUS (it returns an operation): the build resource can take a few
+            # seconds to exist, and a rollouts.create fired in that window 400s with 'build "…" was not
+            # found and is invalid'. That fell through to the firebase-tools CLI, which BLOCKS on the whole
+            # server-side build (yourkith run 35301482944, 2026-09-18: 12 min / 14 billed instead of ~1).
+            # Retry just that error, briefly, before treating the REST path as unavailable.
+            local rhttp tries=0
+            while true; do
+              rhttp=$(curl -sS --max-time 90 -o /tmp/fah_roll.json -w '%{http_code}' \
+                -X POST "${api}/rollouts?rolloutId=${build_id}&requestId=$(cat /proc/sys/kernel/random/uuid)" \
+                -H "Authorization: Bearer $GCP_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"build\":\"${build_name}\"}")
+              if [ "$rhttp" = "400" ] && grep -qiE 'was not found' /tmp/fah_roll.json && [ "$tries" -lt 12 ]; then
+                tries=$((tries + 1))
+                echo "  build ${build_id} not registered yet (${tries}/12) — retrying rollouts.create in 5s"
+                sleep 5; continue
+              fi
+              break
+            done
             if [ "$rhttp" != "200" ] && [ "$rhttp" != "201" ]; then
               if grep -qiE 'already exists' /tmp/fah_roll.json; then
                 echo "Rollout ${build_id} already exists (idempotent retry) — polling it."
@@ -590,3 +627,23 @@ jobs:
           if [ -n "$PREVIEW_URL" ]; then
             echo "| Preview URL | $PREVIEW_URL |" >> $GITHUB_STEP_SUMMARY
           fi
+
+      - name: Record release to the Triarch console
+        if: inputs.console_record
+        continue-on-error: true
+        env:
+          CONSOLE_INGEST_TOKEN: ${{ secrets.CONSOLE_INGEST_TOKEN }}
+          VERSION: ${{ steps.version.outputs.APP_VERSION }}
+          ENV_NAME: ${{ inputs.environment }}
+          GH_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          [ -z "$CONSOLE_INGEST_TOKEN" ] && { echo "::notice::CONSOLE_INGEST_TOKEN not set — console record skipped"; exit 0; }
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # The console takes an envelope: {generatedAt, payload:{…}} — a flat body 400s payload_required.
+          BODY=$(jq -n --arg v "v${VERSION#v}" --arg e "$ENV_NAME" --arg t "$NOW" --arg s "$GH_SHA" --arg b "$BRANCH" \
+            '{generatedAt:$t,payload:{version:$v,env:$e,commitSha:$s,deployedAt:$t,branch:$b}}')
+          CODE=$(curl -s --max-time 15 --retry 3 --retry-all-errors -o /tmp/console.txt -w "%{http_code}" \
+            -X POST "https://admin.triarch.dev/api/ingest/release" \
+            -H "Authorization: Bearer $CONSOLE_INGEST_TOKEN" -H "Content-Type: application/json" -d "$BODY" || echo "000")
+          if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then echo "✓ console release recorded (HTTP $CODE)"; else echo "::warning::console release POST HTTP $CODE: $(head -c 300 /tmp/console.txt)"; fi
