@@ -36,6 +36,14 @@ on:
         required: false
         type: string
         default: 'prod'
+      ci_telemetry:
+        description: >
+          When true, the job reports its own timing and outcome to the Triarch console as a CI Run
+          Telemetry v1 event (release feed, kind "ci-run") from its last step — no extra runner.
+          Callers pass the expression vars.CI_TELEMETRY_ENABLED == 'true'. Default false.
+        required: false
+        type: boolean
+        default: false
       console_record:
         description: >
           When true, also POST the release to the Triarch console (admin.triarch.dev/api/ingest/release) from
@@ -112,6 +120,9 @@ jobs:
     # quality-gate.yml for the v6→v7 pivot rationale.
 
     steps:
+      - name: Stamp job start (CI run telemetry)
+        run: echo "CI_JOB_STARTED=$(date -u +%s)" >> "$GITHUB_ENV"
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -647,3 +658,14 @@ jobs:
             -X POST "https://admin.triarch.dev/api/ingest/release" \
             -H "Authorization: Bearer $CONSOLE_INGEST_TOKEN" -H "Content-Type: application/json" -d "$BODY" || echo "000")
           if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then echo "✓ console release recorded (HTTP $CODE)"; else echo "::warning::console release POST HTTP $CODE: $(head -c 300 /tmp/console.txt)"; fi
+
+      - name: CI run telemetry
+        if: always() && inputs.ci_telemetry
+        uses: triarchsecurity/shared-workflows/.github/actions/ci-telemetry@release/v9
+        with:
+          enabled: 'true'
+          console_token: ${{ secrets.CONSOLE_INGEST_TOKEN }}
+          job_status: ${{ job.status }}
+          started_at_epoch: ${{ env.CI_JOB_STARTED }}
+          app_version: ${{ steps.version.outputs.APP_VERSION }}
+          target_env: ${{ inputs.environment }}
