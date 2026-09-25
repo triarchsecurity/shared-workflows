@@ -47,6 +47,18 @@ on:
           running today are the same script unless somebody changed this line.
         type: string
         default: 'main'
+      package_manager:
+        description: >-
+          `npm` (default) runs `npm audit` against package-lock.json, unchanged.
+          `bun` runs `bun audit --json` against bun.lock and converts its output
+          — a bun repo has no package-lock, so the npm path would audit nothing
+          and the console would refuse the scan.
+        type: string
+        default: 'npm'
+      bun_version:
+        description: 'Bun version for package_manager: bun. Ignored for npm.'
+        type: string
+        default: 'latest'
     secrets:
       VULN_INGEST_KEY:
         description: >-
@@ -86,7 +98,17 @@ jobs:
       # installing would spend minutes to learn nothing extra — while making a
       # scan fail for a reason that has nothing to do with vulnerabilities.
 
+      # An unrecognised value would skip BOTH scan steps below and the job would
+      # go green having scanned nothing — the silent state this pipeline exists
+      # to make impossible. So it fails instead.
+      - name: Check package_manager
+        if: inputs.package_manager != 'npm' && inputs.package_manager != 'bun'
+        run: |
+          echo "::error::package_manager must be npm or bun, got '${{ inputs.package_manager }}'"
+          exit 1
+
       - name: Scan and post
+        if: inputs.package_manager == 'npm'
         working-directory: ${{ inputs.working_directory }}
         env:
           # Lifts the GitHub advisory API rate limit for the GHSA -> CVE lookup.
@@ -100,3 +122,27 @@ jobs:
             --product "${{ inputs.product }}" \
             --url "${{ inputs.admin_url }}" \
             --key "$VULN_INGEST_KEY"
+
+      - uses: oven-sh/setup-bun@v2
+        if: inputs.package_manager == 'bun'
+        with:
+          bun-version: ${{ inputs.bun_version }}
+
+      # `bun audit` exits NON-ZERO when it finds anything (measured: exit 1 with
+      # two advisories, 0 when clean), so `|| true` keeps a finding from failing
+      # the job. It prints NOTHING to stdout without a lockfile; the script
+      # refuses an empty file rather than reading it as clean.
+      - name: Scan and post (bun)
+        if: inputs.package_manager == 'bun'
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VULN_INGEST_KEY: ${{ secrets.VULN_INGEST_KEY }}
+        run: |
+          bun audit --json > "$RUNNER_TEMP/audit.json" || true
+          node "$GITHUB_WORKSPACE/.shared-workflows/scripts/npm-audit-to-scan.mjs" \
+            --product "${{ inputs.product }}" \
+            --url "${{ inputs.admin_url }}" \
+            --key "$VULN_INGEST_KEY" \
+            --audit-json "$RUNNER_TEMP/audit.json" \
+            --format bun

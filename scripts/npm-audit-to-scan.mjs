@@ -25,9 +25,20 @@
  * whole pipeline exists to make visible.
  *
  *   node npm-audit-to-scan.mjs --product <key> --url <base> --key <machine-key> [--dry-run]
+ *     [--audit-json <path>] [--format bun]
+ *
+ * ── BUN REPOS: THE SAME ADVISORIES, A DIFFERENT SHAPE ────────────────────────────────────────────
+ * `npm audit` needs `package-lock.json`; a bun repo has `bun.lock` and would audit nothing and be
+ * refused. `bun audit --json` queries the same GitHub advisory data but prints npm's BULK-ADVISORY
+ * shape (`{pkg: [advisory]}`), not the `{vulnerabilities, metadata}` graph `toFindings` reads. So
+ * `--audit-json` reads audit output from a file instead of running npm, and `--format bun` converts
+ * that shape into the graph. The deps count comes from `bun.lock` itself, because bun's output has
+ * none — and a missing lockfile must still read as "nothing audited", never as clean.
+ * With neither flag the script runs `npm audit` exactly as before.
  */
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 const arg = (name, fallback = null) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -38,8 +49,12 @@ const product = arg('product');
 const baseUrl = (arg('url') ?? '').replace(/\/+$/, '');
 const key = arg('key') ?? process.env.VULN_INGEST_KEY ?? '';
 const dryRun = process.argv.includes('--dry-run');
+const auditJsonPath = arg('audit-json');
+const format = arg('format', 'npm');
 
 if (!product) fail('--product is required');
+if (format !== 'npm' && format !== 'bun') fail(`--format must be npm or bun, got ${format}`);
+if (format === 'bun' && !auditJsonPath) fail('--format bun requires --audit-json <path>');
 if (!dryRun && !baseUrl) fail('--url is required unless --dry-run');
 if (!dryRun && !key) fail('--key or VULN_INGEST_KEY is required unless --dry-run');
 
@@ -60,6 +75,60 @@ function runAudit() {
     }
     fail(`npm audit produced no parseable JSON: ${e.message}`);
   }
+}
+
+/**
+ * Read audit output a previous step wrote. An empty or unparseable file FAILS: `bun audit` prints
+ * nothing to stdout when it has no lockfile, and treating that as `{}` would be a clean result
+ * conjured from no scan at all.
+ */
+function readAuditFile(path) {
+  let text;
+  try { text = readFileSync(path, 'utf8'); } catch (e) { fail(`cannot read --audit-json ${path}: ${e.message}`); }
+  try { return JSON.parse(text); } catch { fail(`--audit-json ${path} is not parseable JSON (${text.length} bytes)`); }
+}
+
+/** Installed packages in `bun.lock` (JSONC: trailing commas). No lockfile, or unreadable = 0. */
+function bunLockPackageCount() {
+  try {
+    const lock = JSON.parse(readFileSync('bun.lock', 'utf8').replace(/,(\s*[}\]])/g, '$1'));
+    return Object.keys(lock.packages ?? {}).length;
+  } catch {
+    return 0;
+  }
+}
+
+function bunVersion() {
+  try { return execFileSync('bun', ['--version'], { encoding: 'utf8' }).trim(); } catch { return 'unknown'; }
+}
+
+/**
+ * bun's bulk-advisory map → the npm-audit graph `toFindings` already consumes. Each advisory is a
+ * `via` OBJECT (a finding), never a string edge; bun reports only the vulnerable package itself.
+ */
+function bunToNpmShape(bulk) {
+  const vulnerabilities = {};
+  for (const [name, advisories] of Object.entries(bulk ?? {})) {
+    if (!Array.isArray(advisories) || advisories.length === 0) continue;
+    vulnerabilities[name] = {
+      name,
+      range: [...new Set(advisories.map((a) => a.vulnerable_versions).filter(Boolean))].join(' || ') || null,
+      via: advisories.map((a) => ({
+        source: a.id, name, dependency: name, title: a.title, url: a.url,
+        severity: a.severity, cwe: a.cwe, cvss: a.cvss, range: a.vulnerable_versions,
+      })),
+    };
+  }
+  return {
+    vulnerabilities,
+    metadata: { dependencies: { total: bunLockPackageCount() }, bunVersion: bunVersion() },
+  };
+}
+
+function loadAudit() {
+  if (!auditJsonPath) return runAudit();
+  const raw = readAuditFile(auditJsonPath);
+  return format === 'bun' ? bunToNpmShape(raw) : raw;
 }
 
 const SEVERITY = { critical: 'critical', high: 'high', moderate: 'medium', low: 'low', info: 'info' };
@@ -172,7 +241,7 @@ async function epssScores(cves) {
 }
 
 const startedAt = new Date().toISOString();
-const audit = runAudit();
+const audit = loadAudit();
 const findings = toFindings(audit);
 
 // GHSA -> CVE first: both downstream lookups are keyed by CVE, so resolving is what makes them
@@ -225,7 +294,9 @@ const scan = {
   scanId: randomUUID(),
   startedAt,
   commitSha: process.env.GITHUB_SHA ?? null,
-  scannerVersion: `npm-audit/${audit.metadata?.npmVersion ?? 'unknown'}`,
+  scannerVersion: format === 'bun'
+    ? `bun-audit/${audit.metadata?.bunVersion ?? 'unknown'}`
+    : `npm-audit/${audit.metadata?.npmVersion ?? 'unknown'}`,
   suppressedCount: 0,
   findings,
 };
